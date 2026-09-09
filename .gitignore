@@ -1,0 +1,7 @@
+node_modules/
+# Defensive: credentials live in $XDG_CONFIG_HOME, never here, but make it
+# impossible to commit one by accident.
+config.json
+*.token
+.env
+*.log
