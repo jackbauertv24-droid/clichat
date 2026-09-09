@@ -45,11 +45,12 @@ export class DeepSeekWebClient {
     return h;
   }
 
-  async post(path, body, extraHeaders) {
+  async post(path, body, extraHeaders, signal) {
     const res = await fetch(BASE + path, {
       method: 'POST',
       headers: this.headers(extraHeaders),
       body: JSON.stringify(body),
+      signal,
     });
     return res;
   }
@@ -114,31 +115,35 @@ export class DeepSeekWebClient {
 
   // Streams one completion. `onDelta({type, text})` is called with incremental
   // text; type is 'content' or 'thinking'. Resolves with the assembled turn.
-  async *stream({ sessionId, parentMessageId = null, prompt, thinking = false, search = false }) {
+  async *stream({
+    sessionId, parentMessageId = null, prompt,
+    thinking = false, search = false, signal,
+  }) {
     const target = '/api/v0/chat/completion';
-    let res = await this.post(target, {
+    const body = {
       chat_session_id: sessionId,
       parent_message_id: parentMessageId,
       prompt,
       ref_file_ids: [],
       thinking_enabled: thinking,
       search_enabled: search,
-    }, { 'x-ds-pow-response': await this.powFor(target) });
+    };
+    const send = async () => this.post(
+      target, body, { 'x-ds-pow-response': await this.powFor(target) }, signal,
+    );
 
-    // 40301 = stale/invalid PoW. Refresh the challenge and retry exactly once.
+    let res = await send();
+
+    // A JSON content-type here means an error envelope rather than an SSE stream.
     if (!res.ok || (res.headers.get('content-type') || '').includes('application/json')) {
       const text = await res.text();
       let code;
       try { code = JSON.parse(text)?.code; } catch { /* not an envelope */ }
+
+      // 40300/40301: the proof-of-work was missing or stale. Retry exactly once
+      // with a freshly minted challenge.
       if (code === 40301 || code === 40300) {
-        res = await this.post(target, {
-          chat_session_id: sessionId,
-          parent_message_id: parentMessageId,
-          prompt,
-          ref_file_ids: [],
-          thinking_enabled: thinking,
-          search_enabled: search,
-        }, { 'x-ds-pow-response': await this.powFor(target) });
+        res = await send();
       } else if (code) {
         throw new DeepSeekError(describeCode(code, JSON.parse(text)?.msg), { code });
       } else if (!res.ok) {
@@ -148,7 +153,9 @@ export class DeepSeekWebClient {
         return;
       }
     }
-    if (!res.ok) throw new DeepSeekError(`HTTP ${res.status} from ${target}`, { status: res.status });
+    if (!res.ok) {
+      throw new DeepSeekError(`HTTP ${res.status} from ${target}`, { status: res.status });
+    }
     yield* parseSSE(res.body, this.debug);
   }
 }

@@ -19,7 +19,16 @@ let instance;
 
 function load() {
   if (instance) return instance;
-  const mod = new WebAssembly.Module(readFileSync(WASM_PATH));
+  let bytes;
+  try {
+    bytes = readFileSync(WASM_PATH);
+  } catch {
+    throw new Error(
+      "DeepSeek hasher not installed. Run `npm run fetch-wasm` "
+      + "(it downloads sha3_wasm_bg.wasm from DeepSeek and verifies its SHA-256).",
+    );
+  }
+  const mod = new WebAssembly.Module(bytes);
   instance = new WebAssembly.Instance(mod, {});
   return instance;
 }

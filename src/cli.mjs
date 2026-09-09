@@ -3,11 +3,13 @@ import { stdin, stdout, stderr } from 'node:process';
 import { DeepSeekWebClient, DeepSeekError } from './client.mjs';
 import { loadConfig, saveConfig, configPath } from './config.mjs';
 import { solveHash, deepseekHash } from './pow.mjs';
+import { ChatTUI } from './tui.mjs';
 
 const HELP = `clichat -- talk to chat.deepseek.com from the terminal
 
 USAGE
-  clichat                      start an interactive session
+  clichat                      start a line-by-line interactive session
+  clichat tui                  start the full-screen chat UI
   clichat "your question"      ask once and print the answer
   echo "question" | clichat    read the prompt from stdin
   clichat auth                 sign in and store a token
@@ -24,6 +26,10 @@ AUTH
   clichat auth --token <jwt>   store a bearer token directly
   clichat auth --waf <cookie>  store an aws-waf-token cookie, if challenged
   Config is written to ${configPath} (mode 0600).
+
+TUI KEYS
+  enter send · ctrl-c stop stream or quit · pgup/pgdn scroll
+  up/down input history · ctrl-l jump to latest · ctrl-w delete word
 
 IN-SESSION COMMANDS
   /new      start a fresh conversation      /think    toggle thinking
@@ -173,6 +179,16 @@ export async function main(argv) {
     token: cfg.token, wafCookie: cfg.wafCookie, debug: opts.debug,
   });
   const state = { sessionId: null, parentMessageId: null };
+
+  if (sub === 'tui') {
+    const tui = new ChatTUI({ client, state, opts });
+    try {
+      await tui.run();
+    } finally {
+      tui.cleanup();
+    }
+    return 0;
+  }
 
   const piped = await readStdin();
   const oneShot = [piped, opts.words.join(' ').trim()].filter(Boolean).join('\n').trim();

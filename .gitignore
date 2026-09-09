@@ -5,3 +5,6 @@ config.json
 *.token
 .env
 *.log
+
+# Fetched from DeepSeek's CDN by scripts/fetch-wasm.mjs, not redistributed here.
+vendor/*.wasm

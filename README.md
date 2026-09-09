@@ -9,21 +9,47 @@ Zero dependencies; Node 20+ (built-in `fetch`, `readline`, `WebAssembly`).
 ## Install
 
 ```sh
-npm link          # or: node bin/clichat.mjs ...
+npm install       # postinstall fetches DeepSeek's hasher and verifies its SHA-256
+npm link          # or just: node bin/clichat.mjs ...
 clichat auth
 ```
+
+The proof-of-work hasher is **not** redistributed here -- it is DeepSeek's asset.
+`scripts/fetch-wasm.mjs` downloads it from their CDN and refuses to install
+anything whose digest does not match the pin in that file. Re-run it any time
+with `npm run fetch-wasm`; `CLICHAT_SKIP_WASM_DOWNLOAD=1` makes install a no-op
+for offline or CI environments.
 
 ## Use
 
 ```sh
-clichat                       # interactive session
+clichat tui                   # full-screen chat UI
+clichat                       # line-by-line interactive session
 clichat "explain CRDTs"       # one-shot
 git diff | clichat "review this"
 clichat -t "prove sqrt2 is irrational"   # thinking model
 clichat -s "what shipped in Node 24?"    # web search
 ```
 
-In-session: `/new` `/think` `/search` `/exit`.
+In-session commands: `/new` `/think` `/search` `/clear` `/help` `/exit`.
+
+### The TUI
+
+`clichat tui` is a full-screen client: a status line, a scrolling transcript,
+and a pinned input line. Reasoning output streams dimmed above the answer.
+
+| key | does |
+| --- | --- |
+| `enter` | send |
+| `ctrl-c` | stop the running stream; again (on an empty line) to quit |
+| `pgup` / `pgdn` | scroll the transcript |
+| `ctrl-l` | jump back to the latest |
+| `up` / `down` | input history |
+| `ctrl-a` / `ctrl-e` / `ctrl-w` / `ctrl-u` | readline-style line editing |
+
+It is written against raw ANSI with no TUI dependency, repaints are coalesced to
+~25fps so a fast token stream does not thrash the terminal, and it restores the
+terminal on exit and on crash.
 
 ## Authenticating
 
@@ -49,8 +75,9 @@ The web app guards `/api/v0/chat/completion` with a proof-of-work challenge:
 
 `DeepSeekHashV1` is a **custom Keccak variant, not standard SHA3-256** — a stock
 `sha3-256` produces different digests and every answer would be rejected. So
-rather than reimplement it, `vendor/sha3_wasm_bg.7b9ca65ddd.wasm` is DeepSeek's
-own hasher, run directly in Node (it imports nothing, so it needs no WASI shim).
+rather than reimplement it, the solver runs DeepSeek's own hasher directly in
+Node (it imports nothing, so it needs no WASI shim). See Install for how that
+binary is fetched and verified.
 
 Verify the solver at any time:
 
@@ -75,12 +102,13 @@ Typical solve is well under 100ms at the observed difficulty of 144000.
 ## Layout
 
 ```
-bin/clichat.mjs   entrypoint
-src/pow.mjs       WASM proof-of-work solver + DeepSeekHashV1
-src/client.mjs    endpoints, PoW retry, SSE parsing
-src/cli.mjs       arg parsing, REPL, one-shot
-src/config.mjs    0600 credential storage
-vendor/*.wasm     DeepSeek's hasher (sha256 b3fca8cc072c1def...)
+bin/clichat.mjs        entrypoint
+src/pow.mjs            WASM proof-of-work solver + DeepSeekHashV1
+src/client.mjs         endpoints, PoW retry, SSE parsing, cancellation
+src/cli.mjs            arg parsing, REPL, one-shot
+src/tui.mjs            full-screen chat UI
+src/config.mjs         0600 credential storage
+scripts/fetch-wasm.mjs downloads + verifies DeepSeek's hasher (not vendored)
 ```
 
 ## Why there is no anonymous mode

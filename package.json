@@ -1,11 +1,15 @@
 {
   "name": "clichat",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Terminal client for the chat.deepseek.com web backend",
   "type": "module",
   "bin": { "clichat": "./bin/clichat.mjs" },
   "engines": { "node": ">=20" },
-  "files": ["bin", "src", "vendor"],
-  "scripts": { "selftest": "node bin/clichat.mjs pow-selftest" },
+  "files": ["bin", "src", "scripts"],
+  "scripts": {
+    "postinstall": "node scripts/fetch-wasm.mjs",
+    "fetch-wasm": "node scripts/fetch-wasm.mjs --strict",
+    "selftest": "node bin/clichat.mjs pow-selftest"
+  },
   "private": true
 }
