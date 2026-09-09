@@ -4,6 +4,7 @@ import { DeepSeekWebClient, DeepSeekError } from './client.mjs';
 import { loadConfig, saveConfig, configPath } from './config.mjs';
 import { solveHash, deepseekHash } from './pow.mjs';
 import { ChatTUI } from './tui.mjs';
+import { createServer } from './server.mjs';
 
 const HELP = `clichat -- talk to chat.deepseek.com from the terminal
 
@@ -12,6 +13,7 @@ USAGE
   clichat tui                  start the full-screen chat UI
   clichat "your question"      ask once and print the answer
   echo "question" | clichat    read the prompt from stdin
+  clichat serve                run an OpenAI-compatible API on localhost
   clichat auth                 sign in and store a token
   clichat pow-selftest         verify the proof-of-work solver
 
@@ -21,6 +23,11 @@ OPTIONS
       --new        force a fresh conversation
       --debug      dump raw server events to stderr
   -h, --help       show this help
+
+SERVE
+  clichat serve [--port 8123] [--host 127.0.0.1] [--api-key <key>]
+  Exposes POST /v1/chat/completions and GET /v1/models. Models:
+  deepseek-chat, deepseek-reasoner, and -search variants of each.
 
 AUTH
   clichat auth --token <jwt>   store a bearer token directly
@@ -46,6 +53,9 @@ function parseArgs(argv) {
     else if (a === '--new') opts.fresh = true;
     else if (a === '-h' || a === '--help') opts.help = true;
     else if (a === '--token') opts.token = argv[++i];
+    else if (a === '--port') opts.port = Number(argv[++i]);
+    else if (a === '--host') opts.host = argv[++i];
+    else if (a === '--api-key') opts.apiKey = argv[++i];
     else if (a === '--waf') opts.waf = argv[++i];
     else opts.words.push(a);
   }
@@ -179,6 +189,29 @@ export async function main(argv) {
     token: cfg.token, wafCookie: cfg.wafCookie, debug: opts.debug,
   });
   const state = { sessionId: null, parentMessageId: null };
+
+  if (sub === 'serve') {
+    const host = opts.host || '127.0.0.1';
+    const port = opts.port || 8123;
+    const isLocal = host === '127.0.0.1' || host === 'localhost' || host === '::1';
+    if (!isLocal && !opts.apiKey) {
+      stderr.write(
+        `refusing to bind ${host} without --api-key: that would expose your `
+        + 'DeepSeek account to the network.\n',
+      );
+      return 1;
+    }
+    const server = createServer({
+      client,
+      apiKey: opts.apiKey ?? null,
+      log: (m) => stderr.write(`${dim(m)}\n`),
+    });
+    await new Promise((resolve) => server.listen(port, host, resolve));
+    stdout.write(`clichat serving an OpenAI-compatible API on http://${host}:${port}/v1\n`);
+    stdout.write(dim(`  models: deepseek-chat, deepseek-reasoner (+ -search variants)\n`));
+    if (!opts.apiKey) stdout.write(dim('  no --api-key set; anyone who can reach this port can use it\n'));
+    await new Promise(() => {}); // run until interrupted
+  }
 
   if (sub === 'tui') {
     const tui = new ChatTUI({ client, state, opts });

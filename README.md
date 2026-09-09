@@ -24,6 +24,7 @@ for offline or CI environments.
 
 ```sh
 clichat tui                   # full-screen chat UI
+clichat serve                 # OpenAI-compatible API on localhost
 clichat                       # line-by-line interactive session
 clichat "explain CRDTs"       # one-shot
 git diff | clichat "review this"
@@ -50,6 +51,55 @@ and a pinned input line. Reasoning output streams dimmed above the answer.
 It is written against raw ANSI with no TUI dependency, repaints are coalesced to
 ~25fps so a fast token stream does not thrash the terminal, and it restores the
 terminal on exit and on crash.
+
+## OpenAI-compatible server
+
+`clichat serve` exposes the web backend as an OpenAI API, so existing tooling can
+point at it unchanged:
+
+```sh
+clichat serve --port 8123
+curl http://127.0.0.1:8123/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"deepseek-reasoner","messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8123/v1", api_key="unused")
+client.chat.completions.create(model="deepseek-chat", messages=[...])
+```
+
+Routes: `POST /v1/chat/completions` (streaming and not), `GET /v1/models`,
+`GET /health`. Models are `deepseek-chat` and `deepseek-reasoner`, each with a
+`-search` variant; `deepseek-reasoner` returns its reasoning in
+`reasoning_content`, matching DeepSeek's own API. An unrecognised model id
+degrades to plain chat rather than erroring, since many clients hardcode names
+like `gpt-4o`.
+
+### Statefulness
+
+The OpenAI API is stateless -- every request resends the full `messages` array --
+but chat.deepseek.com is stateful, keyed by `chat_session_id` and
+`parent_message_id`. Creating a session per request would throw away the
+server-side conversation and resend the whole history as one prompt each time.
+
+So the server keeps an LRU keyed by a hash of the conversation *prefix*. When a
+client appends to `messages` (what every OpenAI client does), the prefix matches
+and only the newest message is forwarded against the existing session. A cold
+key falls back to flattening the history into a single prompt. This is invisible
+to callers; it just means multi-turn chats stay cheap and keep their context.
+
+Two caveats worth knowing:
+
+- **`usage` counts are estimates.** The web backend reports no token usage, so
+  the numbers are derived from character counts. Do not bill anyone from them.
+- **Sampling parameters are ignored.** `temperature`, `top_p`, `max_tokens`,
+  `tools` and friends have no equivalent in the web API, so they are accepted
+  and dropped rather than silently faked.
+
+The server binds `127.0.0.1` by default and refuses a non-local `--host` unless
+you also pass `--api-key`, since the port is a proxy for your DeepSeek account.
 
 ## Authenticating
 
@@ -107,6 +157,7 @@ src/pow.mjs            WASM proof-of-work solver + DeepSeekHashV1
 src/client.mjs         endpoints, PoW retry, SSE parsing, cancellation
 src/cli.mjs            arg parsing, REPL, one-shot
 src/tui.mjs            full-screen chat UI
+src/server.mjs         OpenAI-compatible HTTP front end
 src/config.mjs         0600 credential storage
 scripts/fetch-wasm.mjs downloads + verifies DeepSeek's hasher (not vendored)
 ```
