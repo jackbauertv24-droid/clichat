@@ -26,8 +26,11 @@ OPTIONS
 
 SERVE
   clichat serve [--port 8123] [--host 127.0.0.1] [--api-key <key>]
+                [--emulate-tools]
   Exposes POST /v1/chat/completions and GET /v1/models. Models:
   deepseek-chat, deepseek-reasoner, and -search variants of each.
+  --emulate-tools renders OpenAI tool schemas into the prompt and parses the
+  reply back into tool_calls, since the web backend has no native tool support.
 
 AUTH
   clichat auth --token <jwt>   store a bearer token directly
@@ -56,6 +59,7 @@ function parseArgs(argv) {
     else if (a === '--port') opts.port = Number(argv[++i]);
     else if (a === '--host') opts.host = argv[++i];
     else if (a === '--api-key') opts.apiKey = argv[++i];
+    else if (a === '--emulate-tools') opts.emulateTools = true;
     else if (a === '--waf') opts.waf = argv[++i];
     else opts.words.push(a);
   }
@@ -204,11 +208,13 @@ export async function main(argv) {
     const server = createServer({
       client,
       apiKey: opts.apiKey ?? null,
+      emulateTools: opts.emulateTools === true,
       log: (m) => stderr.write(`${dim(m)}\n`),
     });
     await new Promise((resolve) => server.listen(port, host, resolve));
     stdout.write(`clichat serving an OpenAI-compatible API on http://${host}:${port}/v1\n`);
     stdout.write(dim(`  models: deepseek-chat, deepseek-reasoner (+ -search variants)\n`));
+    if (opts.emulateTools) stdout.write(dim('  tool-call emulation: on (prompt-based, best effort)\n'));
     if (!opts.apiKey) stdout.write(dim('  no --api-key set; anyone who can reach this port can use it\n'));
     await new Promise(() => {}); // run until interrupted
   }

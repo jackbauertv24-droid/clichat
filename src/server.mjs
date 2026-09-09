@@ -14,6 +14,10 @@
 import { createServer as createHttpServer } from 'node:http';
 import { createHash, randomUUID } from 'node:crypto';
 import { DeepSeekError } from './client.mjs';
+import {
+  ToolOutputFilter, renderToolPrompt, toolReminder, toolsSignature, toOpenAIToolCalls,
+  SENTINEL,
+} from './tools.mjs';
 
 const MODELS = [
   { id: 'deepseek-chat', thinking: false, search: false },
@@ -62,12 +66,32 @@ export function flatten(messages) {
     parts.push(contentToText(rest[0].content));
   } else {
     for (const m of rest) {
+      if (m.role === 'tool') { parts.push(renderToolResult(m)); continue; }
+      if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+        // Echo prior calls in the same shape we ask the model to produce, so the
+        // history doubles as a worked example of the format.
+        parts.push(`Assistant: ${SENTINEL}\n${JSON.stringify(m.tool_calls.map((c) => ({
+          name: c.function?.name ?? c.name,
+          arguments: safeArgs(c.function?.arguments ?? c.arguments),
+        })))}`);
+        continue;
+      }
       const label = m.role === 'assistant' ? 'Assistant' : 'User';
       parts.push(`${label}: ${contentToText(m.content)}`);
     }
     parts.push('Assistant:');
   }
   return parts.join('\n\n').trim();
+}
+
+export function renderToolResult(m) {
+  const who = m.name || m.tool_call_id || 'tool';
+  return `Tool result (${who}): ${contentToText(m.content)}`;
+}
+
+function safeArgs(a) {
+  if (typeof a === 'string') { try { return JSON.parse(a); } catch { return {}; } }
+  return a && typeof a === 'object' ? a : {};
 }
 
 class ConversationCache {
@@ -125,7 +149,9 @@ function readBody(req, limit = 8 * 1024 * 1024) {
   });
 }
 
-export function createServer({ client, apiKey = null, log = () => {} } = {}) {
+export function createServer({
+  client, apiKey = null, log = () => {}, emulateTools = false,
+} = {}) {
   const cache = new ConversationCache();
 
   async function completions(req, res, body) {
@@ -138,21 +164,36 @@ export function createServer({ client, apiKey = null, log = () => {} } = {}) {
     const id = `chatcmpl-${randomUUID().replace(/-/g, '').slice(0, 24)}`;
     const created = Math.floor(Date.now() / 1000);
 
-    // Resume the session if this looks like an append to a known conversation.
+    // Tool emulation is opt-in; without it `tools` is accepted and ignored.
+    const wantsTools = emulateTools
+      && Array.isArray(body.tools) && body.tools.length > 0
+      && body.tool_choice !== 'none';
+    const toolsSig = wantsTools ? toolsSignature(body.tools) : null;
+
     const prefixKey = keyOf(messages.slice(0, -1));
     const last = messages[messages.length - 1];
     const cached = messages.length > 1 ? cache.get(prefixKey) : null;
+    // A tool result continues a conversation just as a user turn does.
+    const resumable = cached && (last?.role === 'user' || last?.role === 'tool');
 
     let sessionId;
     let parentMessageId = null;
     let prompt;
-    if (cached && last?.role === 'user') {
+    if (resumable) {
       ({ sessionId, parentMessageId } = cached);
-      prompt = contentToText(last.content);
-      log(`resume session ${String(sessionId).slice(0, 8)} (+1 message)`);
+      prompt = last.role === 'tool' ? renderToolResult(last) : contentToText(last.content);
+      if (wantsTools) {
+        // Re-state the schemas only when the tool set changed under us.
+        const head = cached.toolsSig === toolsSig
+          ? toolReminder()
+          : renderToolPrompt(body.tools, body.tool_choice);
+        prompt = `${head}\n\n${prompt}`;
+      }
+      log(`resume session ${String(sessionId).slice(0, 8)} (+1 ${last.role})`);
     } else {
       sessionId = await client.createSession();
       prompt = flatten(messages);
+      if (wantsTools) prompt = `${renderToolPrompt(body.tools, body.tool_choice)}\n\n${prompt}`;
       log(`new session ${String(sessionId).slice(0, 8)} (${messages.length} messages)`);
     }
 
@@ -160,8 +201,10 @@ export function createServer({ client, apiKey = null, log = () => {} } = {}) {
     res.on('close', () => { if (!res.writableEnded) abort.abort(); });
 
     const promptTokens = estimate(messages.map((m) => contentToText(m.content)).join(' '));
+    const filter = new ToolOutputFilter(wantsTools);
     let content = '';
     let reasoning = '';
+    let toolCalls = null;
 
     const upstream = client.stream({
       sessionId,
@@ -194,13 +237,23 @@ export function createServer({ client, apiKey = null, log = () => {} } = {}) {
         for await (const ev of upstream) {
           if (ev.type === 'message_id') { parentMessageId = ev.id; continue; }
           if (ev.type === 'thinking') { reasoning += ev.text; chunk({ reasoning_content: ev.text }); }
-          else if (ev.type === 'content') { content += ev.text; chunk({ content: ev.text }); }
+          else if (ev.type === 'content') {
+            const out = filter.push(ev.text);
+            if (out) { content += out; chunk({ content: out }); }
+          }
         }
-        chunk({}, 'stop');
+        const fin = filter.finish();
+        if (fin.toolCalls) {
+          toolCalls = fin.toolCalls;
+          chunk({ tool_calls: toOpenAIToolCalls(toolCalls) });
+          chunk({}, 'tool_calls');
+        } else {
+          if (fin.text) { content += fin.text; chunk({ content: fin.text }); }
+          chunk({}, 'stop');
+        }
         res.write('data: [DONE]\n\n');
       } catch (err) {
         if (err?.name !== 'AbortError') {
-          // Headers are already sent, so surface the failure inside the stream.
           res.write(`data: ${JSON.stringify({
             error: { message: err.message, type: 'upstream_error' },
           })}\n\n`);
@@ -213,20 +266,26 @@ export function createServer({ client, apiKey = null, log = () => {} } = {}) {
         for await (const ev of upstream) {
           if (ev.type === 'message_id') parentMessageId = ev.id;
           else if (ev.type === 'thinking') reasoning += ev.text;
-          else if (ev.type === 'content') content += ev.text;
+          else if (ev.type === 'content') content += filter.push(ev.text);
         }
       } catch (err) {
         if (err?.name === 'AbortError') return undefined;
         throw err;
       }
-      const message = { role: 'assistant', content };
+      const fin = filter.finish();
+      if (fin.toolCalls) toolCalls = fin.toolCalls;
+      else if (fin.text) content += fin.text;
+
+      const message = toolCalls
+        ? { role: 'assistant', content: null, tool_calls: toOpenAIToolCalls(toolCalls) }
+        : { role: 'assistant', content };
       if (reasoning) message.reasoning_content = reasoning;
       sendJson(res, 200, {
         id,
         object: 'chat.completion',
         created,
         model: cfg.id,
-        choices: [{ index: 0, message, finish_reason: 'stop' }],
+        choices: [{ index: 0, message, finish_reason: toolCalls ? 'tool_calls' : 'stop' }],
         usage: {
           prompt_tokens: promptTokens,
           completion_tokens: estimate(content + reasoning),
@@ -235,10 +294,14 @@ export function createServer({ client, apiKey = null, log = () => {} } = {}) {
       });
     }
 
-    // Record where this conversation now stands so the next append resumes it.
-    if (content) {
-      cache.set(keyOf([...messages, { role: 'assistant', content }]),
-        { sessionId, parentMessageId });
+    // Record where the conversation now stands. The echoed assistant turn must
+    // match what the client will replay next time, so a tool call echoes as a
+    // null-content assistant message, exactly as OpenAI clients send it back.
+    if (content || toolCalls) {
+      const echo = toolCalls
+        ? { role: 'assistant', content: null }
+        : { role: 'assistant', content };
+      cache.set(keyOf([...messages, echo]), { sessionId, parentMessageId, toolsSig });
     }
     return undefined;
   }

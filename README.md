@@ -77,6 +77,37 @@ Routes: `POST /v1/chat/completions` (streaming and not), `GET /v1/models`,
 degrades to plain chat rather than erroring, since many clients hardcode names
 like `gpt-4o`.
 
+### Tool calling (`--emulate-tools`)
+
+The web backend has no native function calling -- `tool_calls`, `function_call`
+and `tool_choice` appear nowhere in its client bundle. But a tool call is only
+structured text, so the bridge can emulate one:
+
+```sh
+clichat serve --emulate-tools
+```
+
+Outbound, the tool schemas are rendered into the prompt with an instruction to
+reply with a marker followed by JSON. Inbound, that reply is parsed back into
+real OpenAI `tool_calls` with `finish_reason: "tool_calls"`. Prior
+`tool_calls` and `role: "tool"` messages in the history are serialised back to
+text, so the agent loop -- call, run, feed the result back, answer -- works.
+
+The marker exists to protect streaming: output is only withheld while the reply
+could still turn out to be a call. Ordinary prose is recognised on its first
+non-whitespace character and streams through untouched.
+
+The parser is deliberately forgiving of what models actually emit: markdown
+fences, a trailing comma, prose around the JSON, `arguments` as a string rather
+than an object, and arrays for parallel calls. If the buffered text turns out
+not to be a call, it is flushed through as prose rather than lost.
+
+**Understand what this is.** The model was never trained to call tools, so it is
+being asked to imitate a format. Expect it to be less reliable than a model with
+native tool support, especially with large tool sets, and think carefully before
+pointing a tool-using agent with write access at it. Emulation is off by default
+and the plain chat path is untouched by it.
+
 ### Statefulness
 
 The OpenAI API is stateless -- every request resends the full `messages` array --
@@ -94,9 +125,9 @@ Two caveats worth knowing:
 
 - **`usage` counts are estimates.** The web backend reports no token usage, so
   the numbers are derived from character counts. Do not bill anyone from them.
-- **Sampling parameters are ignored.** `temperature`, `top_p`, `max_tokens`,
-  `tools` and friends have no equivalent in the web API, so they are accepted
-  and dropped rather than silently faked.
+- **Sampling parameters are ignored.** `temperature`, `top_p` and `max_tokens`
+  have no equivalent in the web API, so they are accepted and dropped rather
+  than silently faked. `tools` is dropped too unless `--emulate-tools` is set.
 
 The server binds `127.0.0.1` by default and refuses a non-local `--host` unless
 you also pass `--api-key`, since the port is a proxy for your DeepSeek account.
@@ -158,6 +189,7 @@ src/client.mjs         endpoints, PoW retry, SSE parsing, cancellation
 src/cli.mjs            arg parsing, REPL, one-shot
 src/tui.mjs            full-screen chat UI
 src/server.mjs         OpenAI-compatible HTTP front end
+src/tools.mjs          prompt-based tool-call emulation
 src/config.mjs         0600 credential storage
 scripts/fetch-wasm.mjs downloads + verifies DeepSeek's hasher (not vendored)
 ```
