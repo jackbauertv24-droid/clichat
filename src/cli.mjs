@@ -298,8 +298,8 @@ async function runOneTask(client, opts, session, task, approve, ui) {
       ui,
     });
     if (!res.done) {
-      stderr.write(dim(`\nstopped after ${res.steps} steps without finishing; `
-        + 'say "continue" to carry on\n'));
+      stderr.write(dim(`\nstopped after ${res.steps} step${res.steps === 1 ? '' : 's'} `
+        + `without finishing; say 'continue' to carry on\n`));
       return 1;
     }
     stdout.write(dim(`\ndone in ${res.steps} step${res.steps === 1 ? '' : 's'}\n`));
