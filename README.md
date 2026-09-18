@@ -74,9 +74,52 @@ I'll read the file first.
 done in 3 steps
 ```
 
-Every path is resolved inside `--root` (default: the working directory) and
-rejected if it escapes, including by way of a symlink. Each `write` is confirmed
-at the prompt unless you pass `-y`. `--max-steps` caps the loop, at 24 by default.
+Each `write` is confirmed at the prompt unless you pass `-y`. `--max-steps` caps
+the loop, at 24 by default.
+
+### What stops a wrong path
+
+The model was never trained to call tools, so sooner or later it will emit a path
+that makes no sense. Confinement is what makes that a boring error rather than a
+problem on your machine, and it is enforced in layers, because a path string on
+its own cannot carry it:
+
+1. The path is resolved against the **realpath** of the root and rejected if it
+   lands outside — so `../`, an absolute path, and a symlinked directory in the
+   middle are all refused.
+2. A **symlink at the final component is refused outright** rather than followed.
+   This is the subtle one. `existsSync` follows links, so a *dangling* symlink
+   reads as "this leaf does not exist yet", resolves innocently against the root,
+   and the write then follows it straight out of the workspace. Pinned by a test.
+3. A **hard link** with more than one name is refused, since it shares an inode
+   with a file realpath cannot see.
+4. Anything that is not an ordinary file is refused — a fifo would hang the read
+   forever, a device is not ours to touch.
+5. After `mkdir`, the parent is re-resolved and re-checked, and the file is
+   opened with **`O_NOFOLLOW`**, so a symlink that wins the race between the
+   check and the open is refused by the kernel rather than by us.
+
+The **root itself** is checked too: `clichat code` refuses to run with the
+filesystem root, a system directory, or your home directory as its workspace,
+since confinement to those is not a sandbox — it is the whole machine with a
+longer prefix.
+
+```
+$ clichat code --root ~ "tidy my files"
+refusing to use your home directory as a workspace root; run this inside a
+project, or pass --root
+```
+
+A refusal is fed back to the model as a tool error, so it recovers and tries
+something legal rather than failing the task:
+
+```
+  x write ../../ESCAPED.txt (1 lines)  path escapes the workspace root
+  * write notes/hello.txt (1 lines)  created notes/hello.txt
+```
+
+There is still no shell tool, so none of this has to hold against code the model
+gets to run — only against a path it gets to name.
 
 ### Why not just point an agent at `serve --emulate-tools`?
 

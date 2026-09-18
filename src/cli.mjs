@@ -1,6 +1,4 @@
 import { createInterface } from 'node:readline/promises';
-import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { stdin, stdout, stderr } from 'node:process';
 import { DeepSeekWebClient, DeepSeekError } from './client.mjs';
 import { loadConfig, saveConfig, configPath } from './config.mjs';
@@ -8,6 +6,7 @@ import { solveHash, deepseekHash } from './pow.mjs';
 import { ChatTUI } from './tui.mjs';
 import { createServer } from './server.mjs';
 import { runAgent } from './agent.mjs';
+import { resolveRoot, ToolError } from './fstools.mjs';
 
 const HELP = `clichat -- talk to chat.deepseek.com from the terminal
 
@@ -214,8 +213,16 @@ function agentUI() {
 }
 
 async function cmdCode(client, opts, task) {
-  const root = resolve(opts.root || process.cwd());
-  if (!existsSync(root)) { stderr.write(`no such directory: ${root}\n`); return 1; }
+  // resolveRoot refuses a root where confinement would be meaningless -- the
+  // filesystem root, a system directory, your home directory.
+  let root;
+  try {
+    root = resolveRoot(opts.root || process.cwd());
+  } catch (err) {
+    if (!(err instanceof ToolError)) throw err;
+    stderr.write(`${err.message}\n`);
+    return 1;
+  }
 
   // Without a TTY there is nobody to answer the confirmation -- and readStdin has
   // already drained stdin to build the task -- so ask for -y rather than hang.

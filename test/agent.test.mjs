@@ -1,10 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, readFileSync } from 'node:fs';
+import {
+  mkdtempSync, writeFileSync, mkdirSync, symlinkSync, readFileSync, existsSync, linkSync,
+  realpathSync,
+} from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { homedir } from 'node:os';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseToolTags, renderResults, TagSuppressor, renderSystemPrompt } from '../src/agent.mjs';
-import { tools, safePath, ToolError } from '../src/fstools.mjs';
+import { tools, safePath, resolveRoot, ToolError } from '../src/fstools.mjs';
 
 const sandbox = () => mkdtempSync(join(tmpdir(), 'clichat-test-'));
 
@@ -108,36 +113,6 @@ test('a lone angle bracket is not mistaken for a tag', () => {
   assert.equal(drive(['use a < b and ', 'then c > d']), 'use a < b and then c > d');
 });
 
-// -------------------------------------------------------------- confinement
-
-test('safePath allows a path inside the root', () => {
-  const root = sandbox();
-  assert.equal(safePath(root, 'a/b.txt'), join(root, 'a/b.txt'));
-});
-
-test('safePath rejects ..', () => {
-  const root = sandbox();
-  assert.throws(() => safePath(root, '../escape.txt'), ToolError);
-});
-
-test('safePath rejects an absolute path outside the root', () => {
-  const root = sandbox();
-  assert.throws(() => safePath(root, '/etc/passwd'), ToolError);
-});
-
-test('safePath rejects an escape through a symlink', () => {
-  const root = sandbox();
-  const outside = sandbox();
-  writeFileSync(join(outside, 'secret.txt'), 'shh');
-  symlinkSync(outside, join(root, 'link'));
-  assert.throws(() => safePath(root, 'link/secret.txt'), ToolError);
-});
-
-test('safePath rejects a path with a null byte', () => {
-  const root = sandbox();
-  assert.throws(() => safePath(root, 'a\0b'), ToolError);
-});
-
 // -------------------------------------------------------------------- tools
 
 test('write creates parent directories and reports what it did', () => {
@@ -180,4 +155,126 @@ test('list of a file points you at read instead', () => {
   const root = sandbox();
   writeFileSync(join(root, 'a.txt'), 'x');
   assert.throws(() => tools.list.run({ root }, { path: 'a.txt' }), /use read/);
+});
+
+// ------------------------------------------------------- escaping the root
+//
+// These are the cases that decide whether a wrong path in a model reply is a
+// harmless error or a problem on the user's machine, so each one is pinned.
+
+test('a path inside the root is allowed', () => {
+  const root = sandbox();
+  assert.equal(safePath(root, 'a/b.txt'), join(root, 'a/b.txt'));
+});
+
+for (const p of [
+  '../escape.txt', '../../etc/passwd', '/etc/passwd',
+  'a/../../../etc/passwd', './././../x', 'sub/../../out.txt',
+]) {
+  test(`traversal is refused: ${p}`, () => {
+    const root = sandbox();
+    assert.throws(() => safePath(root, p), ToolError);
+  });
+}
+
+test('a null byte in the path is refused', () => {
+  assert.throws(() => safePath(sandbox(), 'a\0b'), ToolError);
+});
+
+test('an empty path is refused', () => {
+  assert.throws(() => safePath(sandbox(), '   '), ToolError);
+});
+
+test('a symlinked directory in the middle is refused', () => {
+  const root = sandbox();
+  const outside = sandbox();
+  writeFileSync(join(outside, 'secret.txt'), 'shh');
+  symlinkSync(outside, join(root, 'link'));
+  assert.throws(() => safePath(root, 'link/secret.txt'), ToolError);
+  assert.throws(() => tools.write.run({ root }, { path: 'link/new.txt' }, 'x'), ToolError);
+});
+
+test('a live symlink at the leaf is not followed', () => {
+  const root = sandbox();
+  const outside = sandbox();
+  const victim = join(outside, 'real.txt');
+  writeFileSync(victim, 'secret');
+  symlinkSync(victim, join(root, 'live'));
+
+  assert.throws(() => tools.write.run({ root }, { path: 'live' }, 'OWNED'), ToolError);
+  assert.throws(() => tools.read.run({ root }, { path: 'live' }), ToolError);
+  assert.equal(readFileSync(victim, 'utf8'), 'secret');
+});
+
+test('a DANGLING symlink at the leaf is not followed', () => {
+  // The subtle one: existsSync follows links, so a dangling link reads as
+  // "this leaf does not exist yet" and resolves innocently against the root.
+  // The write would then create the file outside the workspace.
+  const root = sandbox();
+  const outside = sandbox();
+  const victim = join(outside, 'pwned.txt');
+  symlinkSync(victim, join(root, 'innocent.txt'));
+
+  assert.throws(() => tools.write.run({ root }, { path: 'innocent.txt' }, 'OWNED'), ToolError);
+  assert.equal(existsSync(victim), false, 'a file was created outside the root');
+});
+
+test('a hard link sharing an inode with a file outside is not written', () => {
+  const root = sandbox();
+  const outside = sandbox();
+  const victim = join(outside, 'important.txt');
+  writeFileSync(victim, 'important');
+  try {
+    linkSync(victim, join(root, 'hardlink.txt'));
+  } catch {
+    return; // separate filesystems; nothing to test here
+  }
+  assert.throws(() => tools.write.run({ root }, { path: 'hardlink.txt' }, 'OWNED'), ToolError);
+  assert.equal(readFileSync(victim, 'utf8'), 'important');
+});
+
+test('a fifo is refused rather than blocking the read forever', () => {
+  const root = sandbox();
+  try {
+    execFileSync('mkfifo', [join(root, 'pipe')]);
+  } catch {
+    return; // no mkfifo here
+  }
+  assert.throws(() => tools.read.run({ root }, { path: 'pipe' }), /not an ordinary file/);
+  assert.throws(() => tools.write.run({ root }, { path: 'pipe' }, 'x'), /not an ordinary file/);
+});
+
+test('list marks symlinks instead of following them', () => {
+  const root = sandbox();
+  const outside = sandbox();
+  symlinkSync(outside, join(root, 'link'));
+  assert.match(tools.list.run({ root }, { path: '.' }), /link {2}\(symlink, not followed\)/);
+});
+
+// ------------------------------------------------------------ the root itself
+
+test('a normal directory is accepted, and comes back fully resolved', () => {
+  const root = sandbox();
+  mkdirSync(join(root, 'project'));
+  assert.equal(resolveRoot(join(root, 'project/.')), join(realpathSync(root), 'project'));
+});
+
+for (const dir of ['/', '/etc', '/usr', '/var', '/dev', '/proc']) {
+  test(`a root of ${dir} is refused`, () => {
+    assert.throws(() => resolveRoot(dir), ToolError);
+  });
+}
+
+test('the home directory is refused as a root', () => {
+  assert.throws(() => resolveRoot(homedir()), /home directory/);
+});
+
+test('a missing root is refused', () => {
+  assert.throws(() => resolveRoot('/nonexistent-clichat-root'), /no such directory/);
+});
+
+test('a file is refused as a root', () => {
+  const root = sandbox();
+  writeFileSync(join(root, 'f.txt'), 'x');
+  assert.throws(() => resolveRoot(join(root, 'f.txt')), ToolError);
 });
