@@ -24,6 +24,7 @@ for offline or CI environments.
 
 ```sh
 clichat tui                   # full-screen chat UI
+clichat code "add a test"     # agent loop: reads and writes files
 clichat serve                 # OpenAI-compatible API on localhost
 clichat                       # line-by-line interactive session
 clichat "explain CRDTs"       # one-shot
@@ -51,6 +52,70 @@ and a pinned input line. Reasoning output streams dimmed above the answer.
 It is written against raw ANSI with no TUI dependency, repaints are coalesced to
 ~25fps so a fast token stream does not thrash the terminal, and it restores the
 terminal on exit and on crash.
+
+## The agent (`clichat code`)
+
+`clichat code "<task>"` is a native agent loop. The model is given three tools
+— `read`, `write`, `list` — and keeps going until it answers without calling one.
+
+```sh
+clichat code "add a --json flag to bin/cli.js and document it in the README"
+clichat code --root ../other-project -y "fix the failing test"
+```
+
+```
+-------------------- step 1/24
+I'll read the file first.
+  * read src/slug.js  // Turns a title into a URL slug.
+
+-------------------- step 2/24
+  * write src/slug.js (25 lines)  overwrote src/slug.js (25 lines, 676 bytes)
+
+done in 3 steps
+```
+
+Every path is resolved inside `--root` (default: the working directory) and
+rejected if it escapes, including by way of a symlink. Each `write` is confirmed
+at the prompt unless you pass `-y`. `--max-steps` caps the loop, at 24 by default.
+
+### Why not just point an agent at `serve --emulate-tools`?
+
+That was the original plan, and it works, but it pays for someone else's contract
+twice. Tool schemas arrive as JSON Schema, which is verbose to restate in a
+prompt, and the reply has to come back as JSON — the worst available format for
+the thing an agent mostly does, which is emit the contents of a source file.
+Every newline, quote and backslash has to survive escaping, and a model that was
+never trained to call tools is exactly the model that gets that wrong.
+
+Owning both ends removes the round trip. The grammar is an XML-ish tag whose body
+is **raw**:
+
+```
+<clichat:write path="src/slug.js">
+const RE = /[^\w\s-]/g;          // strip "punctuation" & symbols
+return `=== "${slug(t)}" ===\n\tpath: C:\\site\\${slug(t)}`;
+</clichat:write>
+```
+
+Nothing there needs escaping — regex literals, backslashes, nested quotes and
+template strings all pass through byte for byte. The same content inside a JSON
+`arguments` string is a minefield. `read` and `list` are self-closing:
+`<clichat:read path="src/slug.js"/>`.
+
+Owning the loop also drops the statefulness problem that `serve` has to solve.
+The OpenAI API is stateless, so the server keeps an LRU of conversation prefixes
+to avoid resending the whole history each turn. chat.deepseek.com is stateful
+natively, so the agent just sends the tool results and the session remembers the
+rest.
+
+Three verbs is deliberate. `write` replaces a whole file rather than applying a
+diff, because whole-file output is the thing this model is most reliable at; a
+patch format would fail more often than it would save tokens. There is no shell
+tool — the model cannot run anything, so the worst a confused reply can do is
+write a bad file inside the root.
+
+The parser is the fragile part, so it is the tested part: `npm test` covers tag
+extraction, streaming splits, and the path confinement.
 
 ## OpenAI-compatible server
 
@@ -189,9 +254,12 @@ src/client.mjs         endpoints, PoW retry, SSE parsing, cancellation
 src/cli.mjs            arg parsing, REPL, one-shot
 src/tui.mjs            full-screen chat UI
 src/server.mjs         OpenAI-compatible HTTP front end
-src/tools.mjs          prompt-based tool-call emulation
+src/tools.mjs          prompt-based tool-call emulation (for serve)
+src/agent.mjs          native agent loop: tag protocol, tool dispatch
+src/fstools.mjs        read/write/list, confined to a root directory
 src/config.mjs         0600 credential storage
 scripts/fetch-wasm.mjs downloads + verifies DeepSeek's hasher (not vendored)
+test/                  node:test suite -- `npm test`
 ```
 
 ## Why there is no anonymous mode

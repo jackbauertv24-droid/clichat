@@ -1,10 +1,13 @@
 import { createInterface } from 'node:readline/promises';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { stdin, stdout, stderr } from 'node:process';
 import { DeepSeekWebClient, DeepSeekError } from './client.mjs';
 import { loadConfig, saveConfig, configPath } from './config.mjs';
 import { solveHash, deepseekHash } from './pow.mjs';
 import { ChatTUI } from './tui.mjs';
 import { createServer } from './server.mjs';
+import { runAgent } from './agent.mjs';
 
 const HELP = `clichat -- talk to chat.deepseek.com from the terminal
 
@@ -13,6 +16,7 @@ USAGE
   clichat tui                  start the full-screen chat UI
   clichat "your question"      ask once and print the answer
   echo "question" | clichat    read the prompt from stdin
+  clichat code "do a thing"    run the agent loop: it reads and writes files
   clichat serve                run an OpenAI-compatible API on localhost
   clichat auth                 sign in and store a token
   clichat pow-selftest         verify the proof-of-work solver
@@ -23,6 +27,13 @@ OPTIONS
       --new        force a fresh conversation
       --debug      dump raw server events to stderr
   -h, --help       show this help
+
+CODE
+  clichat code [--root <dir>] [-y] [--max-steps 24] "<task>"
+  A native agent loop. The model gets three tools -- read, write and list --
+  in a tag grammar whose bodies are raw, so file contents need no escaping.
+  Every path is confined to --root (default: the current directory), and each
+  write is confirmed unless -y is passed.
 
 SERVE
   clichat serve [--port 8123] [--host 127.0.0.1] [--api-key <key>]
@@ -61,6 +72,9 @@ function parseArgs(argv) {
     else if (a === '--api-key') opts.apiKey = argv[++i];
     else if (a === '--emulate-tools') opts.emulateTools = true;
     else if (a === '--waf') opts.waf = argv[++i];
+    else if (a === '--root') opts.root = argv[++i];
+    else if (a === '-y' || a === '--yes') opts.yes = true;
+    else if (a === '--max-steps') opts.maxSteps = Number(argv[++i]);
     else opts.words.push(a);
   }
   return opts;
@@ -174,6 +188,73 @@ async function ensureSession(client, state) {
   return state.sessionId;
 }
 
+const green = (s) => (stdout.isTTY ? `\x1b[32m${s}\x1b[0m` : s);
+const red = (s) => (stdout.isTTY ? `\x1b[31m${s}\x1b[0m` : s);
+
+// Renders the agent loop to the terminal. The loop itself knows nothing about
+// ANSI -- it calls these -- so it stays testable and could drive the TUI instead.
+function agentUI() {
+  let thinkingOpen = false;
+  return {
+    step: (n, max) => stdout.write(dim(`\n${'-'.repeat(20)} step ${n}/${max}\n`)),
+    thinkingStart: () => { stdout.write(dim('thinking ')); thinkingOpen = true; },
+    thinking: (t) => stdout.write(dim(t.replace(/\n+/g, ' ').slice(0, 200))),
+    prose: (t) => {
+      if (thinkingOpen) { stdout.write('\n\n'); thinkingOpen = false; }
+      stdout.write(t);
+    },
+    endTurn: () => { stdout.write('\n'); thinkingOpen = false; },
+    toolOk: (label, out) => {
+      const first = String(out).split('\n')[0].slice(0, 70);
+      stdout.write(`  ${green('*')} ${label}${first ? dim(`  ${first}`) : ''}\n`);
+    },
+    toolError: (label, msg) => stdout.write(`  ${red('x')} ${label}  ${red(msg)}\n`),
+    skipped: (label) => stdout.write(`  ${dim(`- ${label}  skipped`)}\n`),
+  };
+}
+
+async function cmdCode(client, opts, task) {
+  const root = resolve(opts.root || process.cwd());
+  if (!existsSync(root)) { stderr.write(`no such directory: ${root}\n`); return 1; }
+
+  // Without a TTY there is nobody to answer the confirmation -- and readStdin has
+  // already drained stdin to build the task -- so ask for -y rather than hang.
+  if (!opts.yes && !stdin.isTTY) {
+    stderr.write('writes need confirming but stdin is not a terminal; pass -y to allow them\n');
+    return 1;
+  }
+
+  stdout.write(`${bold('clichat code')}  ${dim(root)}\n`);
+  if (opts.yes) stdout.write(dim('  writes are not confirmed (-y)\n'));
+
+  // One prompt per write. The model was never trained to call tools, so this is
+  // the backstop for a reply that looks plausible and names the wrong file.
+  const rl = opts.yes ? null : createInterface({ input: stdin, output: stdout });
+  const approve = async (label) => {
+    if (!rl) return true;
+    const a = (await rl.question(`  ${bold('?')} ${label}  [Y/n] `)).trim().toLowerCase();
+    return a === '' || a === 'y' || a === 'yes';
+  };
+
+  try {
+    const res = await runAgent({
+      client, task, root,
+      thinking: opts.think,
+      maxSteps: Number.isFinite(opts.maxSteps) && opts.maxSteps > 0 ? opts.maxSteps : 24,
+      approve,
+      ui: agentUI(),
+    });
+    if (!res.done) {
+      stderr.write(dim(`\nstopped after ${res.steps} steps without finishing\n`));
+      return 1;
+    }
+    stdout.write(dim(`\ndone in ${res.steps} step${res.steps === 1 ? '' : 's'}\n`));
+    return 0;
+  } finally {
+    rl?.close();
+  }
+}
+
 export async function main(argv) {
   const opts = parseArgs(argv);
   const sub = opts.words[0];
@@ -193,6 +274,13 @@ export async function main(argv) {
     token: cfg.token, wafCookie: cfg.wafCookie, debug: opts.debug,
   });
   const state = { sessionId: null, parentMessageId: null };
+
+  if (sub === 'code') {
+    const task = [await readStdin(), opts.words.slice(1).join(' ').trim()]
+      .filter(Boolean).join('\n').trim();
+    if (!task) { stderr.write('usage: clichat code "<task>"\n'); return 1; }
+    return cmdCode(client, opts, task);
+  }
 
   if (sub === 'serve') {
     const host = opts.host || '127.0.0.1';
