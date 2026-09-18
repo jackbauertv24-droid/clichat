@@ -8,6 +8,7 @@ import { join } from 'node:path';
 const DIR = join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'clichat');
 const FILE = join(DIR, 'config.json');
 
+export const configDir = DIR;
 export const configPath = FILE;
 
 export function loadConfig() {

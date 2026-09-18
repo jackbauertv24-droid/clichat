@@ -9,6 +9,7 @@ import { runAgent, createAgentSession } from './agent.mjs';
 import { SessionHub } from './hub.mjs';
 import { createWebServer, isLocalHost } from './webui.mjs';
 import { randomBytes } from 'node:crypto';
+import { rememberSession, recallSession, forgetSession, listSessions } from './sessions.mjs';
 import { resolveRoot, ToolError } from './fstools.mjs';
 
 const HELP = `clichat -- talk to chat.deepseek.com from the terminal
@@ -20,6 +21,7 @@ USAGE
   echo "question" | clichat    read the prompt from stdin
   clichat code                 start an interactive agent session
   clichat code --web           the same session, also served as a web page
+  clichat code --resume        pick up this directory's last conversation
   clichat code "do a thing"    run the agent on one task and exit
   clichat serve                run an OpenAI-compatible API on localhost
   clichat auth                 sign in and store a token
@@ -33,7 +35,7 @@ OPTIONS
   -h, --help       show this help
 
 CODE
-  clichat code [--root <dir>] [-y] [-i] [--max-steps 24] ["<task>"]
+  clichat code [--root <dir>] [-y] [-i] [-r] [--max-steps 24] ["<task>"]
   A native agent loop. The model gets four tools -- read, edit, write, list --
   in a tag grammar whose bodies are raw, so file contents need no escaping.
   edit takes SEARCH/REPLACE blocks and refuses an ambiguous match.
@@ -45,6 +47,11 @@ CODE
   lands in a model that still remembers the files it just read.
   In a session: /new /yes /think /steps /root /web /help /exit
   End a line with \\ to continue it, or type """ alone to open a block.
+
+  -r, --resume reattaches to the last conversation for this directory. The
+  conversation lives on DeepSeek's servers, so the model still remembers the
+  files it read -- your terminal does not, so nothing is replayed. --sessions
+  lists what is saved. /new abandons it and starts over.
 
   --web [port] also serves the session as a web page (default 8787), showing
   the same stream and letting you submit tasks and answer write confirmations
@@ -101,6 +108,8 @@ function parseArgs(argv) {
     }
     else if (a === '--web-port') opts.webPort = Number(argv[++i]);
     else if (a === '--web-host') opts.webHost = argv[++i];
+    else if (a === '--resume' || a === '-r') opts.resume = true;
+    else if (a === '--sessions') opts.listSessions = true;
     else opts.words.push(a);
   }
   return opts;
@@ -351,6 +360,31 @@ function terminalSink(ui, { onAsk, onAnswer, onDone }) {
   };
 }
 
+const ago = (iso) => {
+  const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+  if (!Number.isFinite(s)) return 'at an unknown time';
+  const [n, unit] = s < 90 ? [s, 'second']
+    : s < 5400 ? [s / 60, 'minute']
+    : s < 172800 ? [s / 3600, 'hour']
+    : [s / 86400, 'day'];
+  const v = Math.round(n);
+  return `${v} ${unit}${v === 1 ? '' : 's'} ago`;
+};
+
+function cmdSessions() {
+  const all = listSessions();
+  if (!all.length) {
+    stdout.write('No saved sessions yet. One is remembered per workspace as you use it.\n');
+    return 0;
+  }
+  for (const r of all) {
+    stdout.write(`${bold(r.root)}\n`);
+    stdout.write(dim(`  ${ago(r.updated)}${r.label ? `  ·  ${r.label}` : ''}\n`));
+  }
+  stdout.write(dim('\nResume one by running clichat code --resume in that directory.\n'));
+  return 0;
+}
+
 async function cmdCode(client, opts, task) {
   // resolveRoot refuses a root where confinement would be meaningless -- the
   // filesystem root, a system directory, your home directory.
@@ -392,6 +426,20 @@ async function cmdCode(client, opts, task) {
   }
 
   const session = createAgentSession(root);
+
+  let resumed = null;
+  if (opts.resume) {
+    resumed = recallSession(root);
+    if (resumed) {
+      session.sessionId = resumed.sessionId;
+      session.parentMessageId = resumed.parentMessageId;
+      // Deliberately left unprimed. The server still has the original tool
+      // instructions, but this session may be days old and re-sending them is
+      // about a kilobyte -- cheap insurance against a model that has drifted.
+      session.primed = false;
+    }
+  }
+
   const hub = new SessionHub({
     root,
     run: async (text, { ui, approve }) => {
@@ -402,12 +450,26 @@ async function cmdCode(client, opts, task) {
         maxSteps: Number.isFinite(opts.maxSteps) && opts.maxSteps > 0 ? opts.maxSteps : 24,
       });
       ui.done(res.steps, res.done);
+      // The conversation is on DeepSeek's servers; this is just the pointer
+      // back to it, so a later run can pick the thread up.
+      rememberSession(root, {
+        sessionId: session.sessionId,
+        parentMessageId: session.parentMessageId,
+        label: text,
+      });
       return res;
     },
   });
 
   stdout.write(`${bold('clichat code')}  ${dim(root)}\n`);
   if (opts.yes) stdout.write(dim('  writes are not confirmed (-y)\n'));
+  if (opts.resume && resumed) {
+    stdout.write(dim(`  resumed the session from ${ago(resumed.updated)}`
+      + `${resumed.label ? `: ${resumed.label}` : ''}\n`));
+    stdout.write(dim('  the model still has the conversation; your terminal does not\n'));
+  } else if (opts.resume) {
+    stdout.write(dim('  no saved session for this directory; starting a new one\n'));
+  }
 
   let web = null;
   if (opts.web) {
@@ -506,8 +568,11 @@ async function cmdCode(client, opts, task) {
         continue;
       }
       if (text === '/new') {
-        // A fresh session: the model forgets the files it has already read.
+        // A fresh session: the model forgets the files it has already read,
+        // and the saved pointer goes with it, or --resume would reattach to a
+        // conversation the user has just abandoned.
         Object.assign(session, createAgentSession(root));
+        forgetSession(root);
         stdout.write(dim('started a new conversation\n'));
         continue;
       }
@@ -551,6 +616,8 @@ export async function main(argv) {
   if (sub === 'help') { stdout.write(HELP); return 0; }
   if (sub === 'auth') { await cmdAuth(opts); return 0; }
   if (sub === 'pow-selftest') return cmdPowSelftest();
+  // Listing saved sessions needs neither a token nor stdin, so it comes first.
+  if (sub === 'code' && opts.listSessions) return cmdSessions();
 
   const cfg = loadConfig();
   if (!cfg.token) {

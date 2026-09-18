@@ -65,6 +65,7 @@ clichat code "add a --json flag to bin/cli.js"  # one task, then exit
 clichat code -i "start with the failing test"   # one task, then stay
 clichat code --root ../other-project -y "fix the failing test"
 clichat code --web                              # also serve it as a page
+clichat code --resume                           # pick the last one back up
 ```
 
 ### Sessions
@@ -110,6 +111,38 @@ since it needs nothing added to each line.
 
 Input typed while the agent is working is kept, not dropped, so you can queue a
 follow-up mid-step. A whole session can be piped in for the same reason.
+
+#### Picking it back up
+
+The conversation lives on DeepSeek's servers, keyed by a session id — which is
+exactly why the agent can be sent a bare task and still remember the files it
+read. But that id only ever existed in memory, so quitting threw away a
+conversation the server was perfectly happy to continue.
+
+```sh
+clichat code --resume        # reattach to this directory's last conversation
+clichat code --sessions      # what is saved, newest first
+```
+
+```
+$ clichat code --resume
+clichat code  /home/you/project
+  resumed the session from 2 hours ago: add a --json flag to bin/cli.js
+  the model still has the conversation; your terminal does not
+
+> from memory, which files have you edited so far?
+```
+
+One session is remembered per workspace, in `sessions.json` beside your
+credentials at mode `0600` — the labels quote your own prompts. **Only the
+pointer is stored, never a transcript**, which is why nothing is replayed on
+resume: the model has the history, your scrollback does not. `/new` abandons
+the saved session as well as the live one, so `--resume` cannot reattach to a
+conversation you have just walked away from.
+
+The tool instructions are re-sent on resume even though the server still has
+them. A session may be days old, and about a kilobyte is cheap insurance
+against a model that has drifted.
 
 ### The web view
 
@@ -430,6 +463,7 @@ src/server.mjs         OpenAI-compatible HTTP front end
 src/tools.mjs          prompt-based tool-call emulation (for serve)
 src/agent.mjs          native agent loop: tag protocol, tool dispatch, sessions
 src/hub.mjs            one session, several front ends: fan-out, queue, approvals
+src/sessions.mjs       which conversation belongs to which workspace
 src/webui.mjs          the web view's HTTP surface and its guards
 src/webpage.mjs        that page, as one self-contained document
 src/http.mjs           small helpers shared by both servers
