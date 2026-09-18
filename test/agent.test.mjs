@@ -572,3 +572,41 @@ test('a whole session can be piped in, queued ahead of time', async () => {
   assert.equal(await readTask(q, ''), 'a block\nof text');
   assert.equal(await readTask(q, ''), '/exit');
 });
+
+test('a cancelled read rejects and does not swallow the next line', async () => {
+  // When the browser answers an approval first, the terminal is still blocked
+  // in next(). Without withdrawing that waiter it would eat whatever the user
+  // typed next, and the line would vanish.
+  const rl = new EventEmitter();
+  const q = lineQueue(rl);
+  const ctrl = new AbortController();
+
+  const abandoned = q.next('', { signal: ctrl.signal });
+  assert.equal(q.waiting, 1);
+  ctrl.abort();
+  await assert.rejects(() => abandoned, /cancelled/);
+  assert.equal(q.waiting, 0, 'the waiter was left behind');
+
+  rl.emit('line', 'typed after the cancel');
+  assert.equal(await q.next(), 'typed after the cancel');
+});
+
+test('a read with an already-aborted signal rejects immediately', async () => {
+  const q = lineQueue(new EventEmitter());
+  await assert.rejects(() => q.next('', { signal: AbortSignal.abort() }), /cancelled/);
+  assert.equal(q.waiting, 0);
+});
+
+test('aborting one waiter leaves the others alone', async () => {
+  const rl = new EventEmitter();
+  const q = lineQueue(rl);
+  const ctrl = new AbortController();
+
+  const first = q.next('', { signal: ctrl.signal });
+  const second = q.next();
+  ctrl.abort();
+  await assert.rejects(() => first, /cancelled/);
+
+  rl.emit('line', 'for the second');
+  assert.equal(await second, 'for the second');
+});

@@ -64,6 +64,7 @@ clichat code                                    # interactive session
 clichat code "add a --json flag to bin/cli.js"  # one task, then exit
 clichat code -i "start with the failing test"   # one task, then stay
 clichat code --root ../other-project -y "fix the failing test"
+clichat code --web                              # also serve it as a page
 ```
 
 ### Sessions
@@ -91,6 +92,7 @@ already has.
 | `/think` | toggle the reasoning model |
 | `/steps N` | set the step cap |
 | `/root` | show the workspace root |
+| `/web` | whether the web view is running |
 | `/exit` | leave |
 
 A task worth giving an agent is often a paragraph, and argv is a poor place to
@@ -108,6 +110,55 @@ since it needs nothing added to each line.
 
 Input typed while the agent is working is kept, not dropped, so you can queue a
 follow-up mid-step. A whole session can be piped in for the same reason.
+
+### The web view
+
+`clichat code --web` runs the ordinary terminal session **and** serves it as a
+page. Both are live at once: the same stream renders in both, and either can
+submit a task or answer a write confirmation.
+
+```
+$ clichat code --web
+clichat code  /home/you/project
+  web view  http://127.0.0.1:8787/#e5c280624b8e3ba3…
+  that link is the credential; anything without it is refused
+```
+
+A single page, no build step and no CDN — the same choice `src/tui.mjs` makes in
+writing raw ANSI rather than taking a dependency. Tool calls render as compact
+rows, an approval is a card with **Approve** / **Decline**, and `Enter` sends
+while `Shift+Enter` makes a new line, so a paragraph-long task needs no `"""`.
+
+Whoever answers a confirmation first wins; the other side is told who settled it
+and its buttons go dead. Reloading mid-run replays the transcript and carries on
+streaming, because every event is indexed and the page reconnects with `?since=`.
+
+It also runs with no terminal at all — useful from a detached shell:
+
+```sh
+clichat code --web --root ~/project    # drive it entirely from the browser
+```
+
+#### What guards it
+
+This endpoint writes files, so it is held to a higher standard than `serve`,
+which only spends quota:
+
+- **Loopback only.** A non-local `--web-host` is refused outright. There is no
+  `--api-key` style escape hatch, because the blast radius is your disk.
+- **A per-run token**, carried in the URL's `#fragment` — which browsers never
+  send to a server. It stays out of request lines, server logs and `Referer`
+  headers. `GET /` is open because the document is inert without one.
+- **POSTs require the token in a header**, not the body. A custom header cannot
+  be sent cross-origin without a preflight, and no route answers one, so a
+  hostile page in another tab cannot drive the agent even knowing the port.
+- **No CORS at all**, unlike `serve`, which exists to be called by other tools.
+- **The `Host` header is checked**, which is what stops DNS rebinding turning a
+  public name into a loopback request.
+- **`--web` with `-y` is refused**, since together they would mean anyone
+  reaching the port writes files with no confirmation whatsoever.
+
+All of the above is covered by tests that drive a real server on a real port.
 
 ```
 -------------------- step 1/24
@@ -378,6 +429,10 @@ src/tui.mjs            full-screen chat UI
 src/server.mjs         OpenAI-compatible HTTP front end
 src/tools.mjs          prompt-based tool-call emulation (for serve)
 src/agent.mjs          native agent loop: tag protocol, tool dispatch, sessions
+src/hub.mjs            one session, several front ends: fan-out, queue, approvals
+src/webui.mjs          the web view's HTTP surface and its guards
+src/webpage.mjs        that page, as one self-contained document
+src/http.mjs           small helpers shared by both servers
 src/fstools.mjs        read/edit/write/list, confined to a root directory
 src/config.mjs         0600 credential storage
 scripts/fetch-wasm.mjs downloads + verifies DeepSeek's hasher (not vendored)

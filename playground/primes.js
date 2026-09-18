@@ -1,7 +1,7 @@
 // Find all prime numbers up to a given limit using the Sieve of Eratosthenes
 
 function findPrimes(limit) {
-  if (limit < 2) return [];
+  if (!Number.isInteger(limit) || limit < 2) return [];
 
   // isComposite[i] is true if i is not prime
   const isComposite = new Array(limit + 1).fill(false);
@@ -21,7 +21,7 @@ function findPrimes(limit) {
   return primes;
 }
 
-const LIMIT = 10000;
+const LIMIT = 50000;
 const primes = findPrimes(LIMIT);
 
 console.log(`Found ${primes.length} primes up to ${LIMIT}:`);

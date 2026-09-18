@@ -1,6 +1,6 @@
 {
   "name": "clichat",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Terminal client for the chat.deepseek.com web backend",
   "type": "module",
   "bin": { "clichat": "./bin/clichat.mjs" },

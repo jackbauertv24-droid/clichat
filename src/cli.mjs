@@ -6,6 +6,9 @@ import { solveHash, deepseekHash } from './pow.mjs';
 import { ChatTUI } from './tui.mjs';
 import { createServer } from './server.mjs';
 import { runAgent, createAgentSession } from './agent.mjs';
+import { SessionHub } from './hub.mjs';
+import { createWebServer, isLocalHost } from './webui.mjs';
+import { randomBytes } from 'node:crypto';
 import { resolveRoot, ToolError } from './fstools.mjs';
 
 const HELP = `clichat -- talk to chat.deepseek.com from the terminal
@@ -16,6 +19,7 @@ USAGE
   clichat "your question"      ask once and print the answer
   echo "question" | clichat    read the prompt from stdin
   clichat code                 start an interactive agent session
+  clichat code --web           the same session, also served as a web page
   clichat code "do a thing"    run the agent on one task and exit
   clichat serve                run an OpenAI-compatible API on localhost
   clichat auth                 sign in and store a token
@@ -39,8 +43,14 @@ CODE
   With no task it starts an interactive session; -i does the same after
   running the task you gave it. A session keeps its context, so a follow-up
   lands in a model that still remembers the files it just read.
-  In a session: /new /yes /think /steps /root /help /exit
+  In a session: /new /yes /think /steps /root /web /help /exit
   End a line with \\ to continue it, or type """ alone to open a block.
+
+  --web [port] also serves the session as a web page (default 8787), showing
+  the same stream and letting you submit tasks and answer write confirmations
+  from a browser. It binds loopback only and prints a link whose #fragment is
+  the credential; requests without it are refused. It cannot be combined with
+  -y. Works with no terminal at all, so a detached shell can serve it.
 
 SERVE
   clichat serve [--port 8123] [--host 127.0.0.1] [--api-key <key>]
@@ -83,6 +93,14 @@ function parseArgs(argv) {
     else if (a === '-y' || a === '--yes') opts.yes = true;
     else if (a === '--max-steps') opts.maxSteps = Number(argv[++i]);
     else if (a === '-i' || a === '--interactive') opts.interactive = true;
+    else if (a === '--web') {
+      opts.web = true;
+      // --web may carry a port, or stand alone before the task.
+      const n = Number(argv[i + 1]);
+      if (Number.isInteger(n) && n > 0 && n < 65536) opts.webPort = Number(argv[++i]);
+    }
+    else if (a === '--web-port') opts.webPort = Number(argv[++i]);
+    else if (a === '--web-host') opts.webHost = argv[++i];
     else opts.words.push(a);
   }
   return opts;
@@ -224,7 +242,8 @@ function agentUI() {
 const CODE_HELP = `  /new      forget the conversation and start fresh
   /yes      toggle confirming each write      /think   toggle the reasoning model
   /steps N  set the step cap                  /root    show the workspace root
-  /help     this list                         /exit    leave
+  /web      is the web view running?          /help    this list
+  /exit     leave
 
   end a line with \\ to continue it, or type """ alone to open a block`;
 
@@ -250,12 +269,25 @@ export function lineQueue(rl) {
   });
 
   return {
-    next(prompt = '') {
+    // `signal` matters when two front ends can answer the same question: once
+    // the browser settles an approval, the terminal's pending read has to be
+    // withdrawn, or it would swallow the next line somebody types.
+    next(prompt = '', { signal } = {}) {
       if (prompt) stdout.write(prompt);
       if (ready.length) return Promise.resolve(ready.shift());
       if (closed) return Promise.reject(new Error('input closed'));
-      return new Promise((resolve, reject) => waiting.push({ resolve, reject }));
+      if (signal?.aborted) return Promise.reject(new Error('cancelled'));
+
+      return new Promise((resolve, reject) => {
+        const waiter = { resolve, reject };
+        waiting.push(waiter);
+        signal?.addEventListener('abort', () => {
+          const at = waiting.indexOf(waiter);
+          if (at >= 0) { waiting.splice(at, 1); reject(new Error('cancelled')); }
+        }, { once: true });
+      });
     },
+    get waiting() { return waiting.length; },
   };
 }
 
@@ -287,30 +319,36 @@ export async function readTask(input, prompt) {
   return parts.join('\n').trim();
 }
 
-// Runs one task and reports how it ended. Returns the exit code for one-shot use.
-async function runOneTask(client, opts, session, task, approve, ui) {
-  try {
-    const res = await runAgent({
-      client, task, session,
-      thinking: opts.think,
-      maxSteps: Number.isFinite(opts.maxSteps) && opts.maxSteps > 0 ? opts.maxSteps : 24,
-      approve,
-      ui,
-    });
-    if (!res.done) {
-      stderr.write(dim(`\nstopped after ${res.steps} step${res.steps === 1 ? '' : 's'} `
-        + `without finishing; say 'continue' to carry on\n`));
-      return 1;
+// Turns hub events back into terminal output.
+//
+// Both front ends render from the same event stream, so what the browser shows
+// and what the terminal prints cannot drift -- and a task typed in the browser
+// still streams here.
+function terminalSink(ui, { onAsk, onAnswer, onDone }) {
+  return (e) => {
+    switch (e.type) {
+      case 'task':
+        // A task typed here was already echoed by readline; one from the
+        // browser has to be shown, or the output arrives with no question.
+        if (e.by !== 'terminal') stdout.write(`\n${bold('>')} ${e.text}\n`);
+        break;
+      case 'step': ui.step(e.n, e.max); break;
+      case 'thinkingStart': ui.thinkingStart(); break;
+      case 'thinking': ui.thinking(e.text); break;
+      case 'prose': ui.prose(e.text); break;
+      case 'endTurn': ui.endTurn(); break;
+      case 'tool':
+        if (e.status === 'ok') ui.toolOk(e.label, e.output);
+        else if (e.status === 'error') ui.toolError(e.label, e.output);
+        else ui.skipped(e.label);
+        break;
+      case 'ask': onAsk(e); break;
+      case 'answer': onAnswer(e); break;
+      case 'done': onDone(e); break;
+      case 'error': stderr.write(`\n${e.message}\n`); break;
+      default: break;
     }
-    stdout.write(dim(`\ndone in ${res.steps} step${res.steps === 1 ? '' : 's'}\n`));
-    return 0;
-  } catch (err) {
-    if (err instanceof DeepSeekError || err instanceof ToolError) {
-      stderr.write(`\n${err.message}\n`);
-      return 1;
-    }
-    throw err;
-  }
+  };
 }
 
 async function cmdCode(client, opts, task) {
@@ -325,41 +363,130 @@ async function cmdCode(client, opts, task) {
     return 1;
   }
 
-  // A one-shot task with no terminal has nobody to answer the confirmation --
-  // and readStdin has already drained stdin -- so ask for -y rather than hang.
-  const interactive = !task || opts.interactive;
-  if (!opts.yes && !stdin.isTTY) {
+  const webHost = opts.webHost || '127.0.0.1';
+  if (opts.web) {
+    // No --api-key style escape hatch here: `serve` exposes your quota, this
+    // exposes your disk.
+    if (!isLocalHost(webHost)) {
+      stderr.write(`refusing to serve the web view on ${webHost}: it can write files, `
+        + 'so it is loopback only\n');
+      return 1;
+    }
+    if (opts.yes) {
+      stderr.write('refusing --web together with -y: that would let anyone who reaches '
+        + 'the port write files with no confirmation\n');
+      return 1;
+    }
+  }
+
+  // With --web the browser can answer confirmations, so a terminal is optional.
+  const hasTerminal = Boolean(stdin.isTTY);
+  const interactive = !task || opts.interactive || opts.web;
+  if (!opts.yes && !hasTerminal && !opts.web) {
     stderr.write('writes need confirming but stdin is not a terminal; pass -y to allow them\n');
     return 1;
   }
-  if (interactive && !stdin.isTTY) {
+  if (interactive && !hasTerminal && !opts.web) {
     stderr.write('clichat code needs a task argument when stdin is not a terminal\n');
     return 1;
   }
 
+  const session = createAgentSession(root);
+  const hub = new SessionHub({
+    root,
+    run: async (text, { ui, approve }) => {
+      const res = await runAgent({
+        client, task: text, session, ui,
+        approve: opts.yes ? async () => true : approve,
+        thinking: opts.think,
+        maxSteps: Number.isFinite(opts.maxSteps) && opts.maxSteps > 0 ? opts.maxSteps : 24,
+      });
+      ui.done(res.steps, res.done);
+      return res;
+    },
+  });
+
   stdout.write(`${bold('clichat code')}  ${dim(root)}\n`);
   if (opts.yes) stdout.write(dim('  writes are not confirmed (-y)\n'));
-  if (interactive) stdout.write(dim('  /help for commands, /exit to leave\n'));
 
-  const session = createAgentSession(root);
-  const ui = agentUI();
-  const rl = (opts.yes && !interactive)
-    ? null
-    : createInterface({ input: stdin, output: stdout, historySize: 500 });
+  let web = null;
+  if (opts.web) {
+    const token = randomBytes(24).toString('hex');
+    web = createWebServer({ hub, token, log: (m) => stderr.write(`${dim(m)}\n`) });
+    try {
+      await new Promise((resolve, reject) => {
+        web.once('error', reject);
+        web.listen(opts.webPort || 8787, webHost, resolve);
+      });
+    } catch (err) {
+      stderr.write(`could not start the web view: ${err.message}\n`);
+      return 1;
+    }
+    const { port } = web.address();
+    // The token is in the fragment, which the browser never sends to a server.
+    stdout.write(`  web view  http://${webHost}:${port}/#${token}\n`);
+    stdout.write(dim('  that link is the credential; anything without it is refused\n'));
+  }
+  if (interactive && hasTerminal) stdout.write(dim('  /help for commands, /exit to leave\n'));
+
+  const rl = (hasTerminal && (interactive || !opts.yes))
+    ? createInterface({ input: stdin, output: stdout, historySize: 500 })
+    : null;
   const input = rl ? lineQueue(rl) : null;
 
-  // One prompt per write. The model was never trained to call tools, so this is
-  // the backstop for a reply that looks plausible and names the wrong file.
-  const approve = async (label) => {
-    if (opts.yes || !input) return true;
-    const a = (await input.next(`  ${bold('?')} ${label}  [Y/n] `)).trim().toLowerCase();
-    return a === '' || a === 'y' || a === 'yes';
+  let lastOk = true;
+  let askAbort = null;
+
+  // One prompt per write. Whoever answers first wins; the loser's pending read
+  // is withdrawn so it does not swallow the next line typed.
+  const askAtTerminal = async (e) => {
+    if (!input) return;
+    const ctrl = new AbortController();
+    askAbort = ctrl;
+    try {
+      const a = (await input.next(`  ${bold('?')} ${e.label}  [Y/n] `, { signal: ctrl.signal }))
+        .trim().toLowerCase();
+      hub.answer(e.id, a === '' || a === 'y' || a === 'yes', 'terminal');
+    } catch {
+      /* answered elsewhere, or input closed */
+    } finally {
+      if (askAbort === ctrl) askAbort = null;
+    }
   };
 
+  const detach = hub.attach(terminalSink(agentUI(), {
+    onAsk: (e) => { askAtTerminal(e); },
+    onAnswer: (e) => {
+      // A prompt was still on screen if we had a read outstanding; break the
+      // line so the note does not land beside an unanswered "[Y/n]".
+      const wasPrompting = Boolean(askAbort);
+      if (askAbort) { askAbort.abort(); askAbort = null; }
+      if (e.by !== 'terminal') {
+        stdout.write(dim(`${wasPrompting ? '\n' : ''}  ${e.ok ? 'approved' : 'declined'} in the ${e.by}\n`));
+      }
+    },
+    onDone: (e) => {
+      lastOk = e.ok;
+      if (e.ok) stdout.write(dim(`\ndone in ${e.steps} step${e.steps === 1 ? '' : 's'}\n`));
+      else {
+        stderr.write(dim(`\nstopped after ${e.steps} step${e.steps === 1 ? '' : 's'} `
+          + `without finishing; say 'continue' to carry on\n`));
+      }
+    },
+  }));
+
   try {
-    let code = 0;
-    if (task) code = await runOneTask(client, opts, session, task, approve, ui);
-    if (!interactive) return code;
+    if (task) {
+      hub.submit(task, 'terminal');
+      await hub.settled();
+    }
+    if (!interactive) return lastOk ? 0 : 1;
+
+    // Web-only: no terminal to read from, so just serve until interrupted.
+    if (!input) {
+      stdout.write(dim('  no terminal attached; drive it from the web view\n'));
+      await new Promise(() => {});
+    }
 
     for (;;) {
       let text;
@@ -373,6 +500,11 @@ async function cmdCode(client, opts, task) {
       if (text === '/exit' || text === '/quit') break;
       if (text === '/help') { stdout.write(`${CODE_HELP}\n`); continue; }
       if (text === '/root') { stdout.write(dim(`${root}\n`)); continue; }
+      if (text === '/web') {
+        stdout.write(dim(web ? 'the web view is running; see the link above\n'
+          : 'not serving a web view; restart with --web\n'));
+        continue;
+      }
       if (text === '/new') {
         // A fresh session: the model forgets the files it has already read.
         Object.assign(session, createAgentSession(root));
@@ -380,6 +512,7 @@ async function cmdCode(client, opts, task) {
         continue;
       }
       if (text === '/yes') {
+        if (web) { stdout.write(dim('not while the web view is running\n')); continue; }
         opts.yes = !opts.yes;
         stdout.write(dim(`writes are ${opts.yes ? 'no longer confirmed' : 'confirmed again'}\n`));
         continue;
@@ -399,11 +532,14 @@ async function cmdCode(client, opts, task) {
       }
       if (text.startsWith('/')) { stdout.write(dim(`unknown command; ${'/help'} lists them\n`)); continue; }
 
-      code = await runOneTask(client, opts, session, text, approve, ui);
+      hub.submit(text, 'terminal');
+      await hub.settled();
     }
-    return code;
+    return lastOk ? 0 : 1;
   } finally {
+    detach();
     rl?.close();
+    web?.close();
   }
 }
 

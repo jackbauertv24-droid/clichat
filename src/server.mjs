@@ -12,6 +12,7 @@
 // session. A cold key falls back to flattening the history into one prompt.
 
 import { createServer as createHttpServer } from 'node:http';
+import { sendJson as rawSendJson, cors, readBody } from './http.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { DeepSeekError } from './client.mjs';
 import {
@@ -114,40 +115,13 @@ class ConversationCache {
 // clients read these fields. Documented as an approximation, not a bill.
 const estimate = (s) => Math.max(1, Math.ceil((s || '').length / 4));
 
-function sendJson(res, status, body, extra = {}) {
-  const payload = JSON.stringify(body);
-  res.writeHead(status, {
-    'content-type': 'application/json',
-    'content-length': Buffer.byteLength(payload),
-    ...cors(),
-    ...extra,
-  });
-  res.end(payload);
-}
+// This API is called by other tools, so every response carries CORS. The web
+// view deliberately does not; see src/http.mjs.
+const sendJson = (res, status, body, extra = {}) =>
+  rawSendJson(res, status, body, { ...cors(), ...extra });
 
-const cors = () => ({
-  'access-control-allow-origin': '*',
-  'access-control-allow-headers': 'authorization, content-type',
-  'access-control-allow-methods': 'GET, POST, OPTIONS',
-});
-
-function sendError(res, status, message, type = 'invalid_request_error') {
+const sendError = (res, status, message, type = 'invalid_request_error') =>
   sendJson(res, status, { error: { message, type, code: status } });
-}
-
-function readBody(req, limit = 8 * 1024 * 1024) {
-  return new Promise((resolve, reject) => {
-    let size = 0;
-    const chunks = [];
-    req.on('data', (c) => {
-      size += c.length;
-      if (size > limit) { reject(new Error('request body too large')); req.destroy(); return; }
-      chunks.push(c);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-    req.on('error', reject);
-  });
-}
 
 export function createServer({
   client, apiKey = null, log = () => {}, emulateTools = false,
