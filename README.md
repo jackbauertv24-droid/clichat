@@ -55,8 +55,9 @@ terminal on exit and on crash.
 
 ## The agent (`clichat code`)
 
-`clichat code "<task>"` is a native agent loop. The model is given three tools
-— `read`, `write`, `list` — and keeps going until it answers without calling one.
+`clichat code "<task>"` is a native agent loop. The model is given four tools
+— `read`, `edit`, `write`, `list` — and keeps going until it answers without
+calling one.
 
 ```sh
 clichat code "add a --json flag to bin/cli.js and document it in the README"
@@ -145,17 +146,50 @@ template strings all pass through byte for byte. The same content inside a JSON
 `arguments` string is a minefield. `read` and `list` are self-closing:
 `<clichat:read path="src/slug.js"/>`.
 
+### Editing
+
+`write` replaces a whole file, which is wasteful for a one-line change and
+invites the model to garble the parts it was not asked to touch. `edit` takes
+SEARCH/REPLACE blocks instead:
+
+```
+<clichat:edit path="src/server.js">
+<<<<<<< SEARCH
+const PORT = 3000;
+=======
+const PORT = process.env.PORT || 3000;
+>>>>>>> REPLACE
+</clichat:edit>
+```
+
+That grammar is chosen for the same reason as the tag: it is all over the
+training data, so the model already knows the shape without being taught it.
+Several blocks can go in one tag and are applied in order, and an empty REPLACE
+deletes the lines.
+
+**SEARCH must match exactly one place in the file.** If it matches none, or more
+than one, the edit is refused and the model is told which — it is not applied to
+a best guess. Quietly editing the wrong one of two matches is the failure this
+is designed against, and it is the kind of thing you would not notice until much
+later.
+
+Two slips are tolerated, because they are the ones models actually make and
+neither creates ambiguity: trailing whitespace, and a block quoted at the wrong
+indentation. The indent has to be wrong *uniformly* — the same prefix added to
+or removed from every line, which is what happens when a snippet gets
+re-indented. The replacement is then re-indented to match the file. A
+non-uniform mismatch is refused, since resolving it would be a guess.
+
 Owning the loop also drops the statefulness problem that `serve` has to solve.
 The OpenAI API is stateless, so the server keeps an LRU of conversation prefixes
 to avoid resending the whole history each turn. chat.deepseek.com is stateful
 natively, so the agent just sends the tool results and the session remembers the
 rest.
 
-Three verbs is deliberate. `write` replaces a whole file rather than applying a
-diff, because whole-file output is the thing this model is most reliable at; a
-patch format would fail more often than it would save tokens. There is no shell
-tool — the model cannot run anything, so the worst a confused reply can do is
-write a bad file inside the root.
+Four verbs is deliberate. There is no shell tool — the model cannot run
+anything, so the worst a confused reply can do is write a bad file inside the
+root, and the confinement below only has to hold against a path the model
+names, not against code it gets to execute.
 
 The parser is the fragile part, so it is the tested part: `npm test` covers tag
 extraction, streaming splits, and the path confinement.
@@ -299,7 +333,7 @@ src/tui.mjs            full-screen chat UI
 src/server.mjs         OpenAI-compatible HTTP front end
 src/tools.mjs          prompt-based tool-call emulation (for serve)
 src/agent.mjs          native agent loop: tag protocol, tool dispatch
-src/fstools.mjs        read/write/list, confined to a root directory
+src/fstools.mjs        read/edit/write/list, confined to a root directory
 src/config.mjs         0600 credential storage
 scripts/fetch-wasm.mjs downloads + verifies DeepSeek's hasher (not vendored)
 test/                  node:test suite -- `npm test`

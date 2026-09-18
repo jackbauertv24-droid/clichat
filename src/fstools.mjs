@@ -139,6 +139,110 @@ function openRegular(full, shown, { write = false } = {}) {
   }
 }
 
+// ------------------------------------------------------------ search/replace
+//
+// The edit grammar is the SEARCH/REPLACE block, deliberately: it is all over
+// the training data, so the model already knows the shape without being taught
+// it. Inside a raw tag body the markers need no escaping either.
+//
+//   <<<<<<< SEARCH
+//   the exact lines to find
+//   =======
+//   what to put there instead
+//   >>>>>>> REPLACE
+
+const HEAD = /^[ \t]*<{5,9} *SEARCH *$/;
+const MID = /^[ \t]*={5,9} *$/;
+const TAIL = /^[ \t]*>{5,9} *REPLACE *$/;
+
+export function parseEditBlocks(body) {
+  const lines = String(body).split('\n');
+  const blocks = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!HEAD.test(lines[i])) continue;
+    const search = [];
+    for (i++; i < lines.length && !MID.test(lines[i]); i++) search.push(lines[i]);
+    if (i >= lines.length) throw new ToolError('an edit block is missing its ======= divider');
+    const replace = [];
+    for (i++; i < lines.length && !TAIL.test(lines[i]); i++) replace.push(lines[i]);
+    if (i >= lines.length) throw new ToolError('an edit block is missing its >>>>>>> REPLACE line');
+    if (!search.length) {
+      throw new ToolError('an edit block has an empty SEARCH section; use write to create a file');
+    }
+    blocks.push({ search: search.join('\n'), replace: replace.join('\n') });
+  }
+  if (!blocks.length) {
+    throw new ToolError('no <<<<<<< SEARCH / ======= / >>>>>>> REPLACE block found');
+  }
+  return blocks;
+}
+
+const rstrip = (s) => s.replace(/[ \t]+$/, '');
+const indentOf = (s) => s.match(/^[ \t]*/)[0];
+
+// Finds the one window of `lines` matching `want`, tolerating two slips the
+// model actually makes: trailing whitespace, and a block quoted at the wrong
+// indentation. The indent has to be wrong *uniformly* -- a consistent prefix
+// added to or removed from every line -- which is what happens when a model
+// re-indents a snippet, and is narrow enough not to match something unintended.
+//
+// Anything ambiguous is an error rather than a guess. Silently editing the
+// wrong one of two matches is the failure mode worth designing against.
+function locate(lines, want) {
+  const wl = want.split('\n');
+  const hits = [];
+
+  for (let i = 0; i + wl.length <= lines.length; i++) {
+    let delta = null;
+    let ok = true;
+    for (let j = 0; j < wl.length; j++) {
+      const have = rstrip(lines[i + j]);
+      const need = rstrip(wl[j]);
+      if (have === need) continue;
+      if (have.trim() !== need.trim()) { ok = false; break; }
+      if (!need.trim()) continue;                       // blank either way
+      const d = indentOf(have).slice(0, indentOf(have).length - indentOf(need).length);
+      if (indentOf(have) !== d + indentOf(need)) { ok = false; break; }
+      if (delta === null) delta = d;
+      else if (delta !== d) { ok = false; break; }      // indent shift not uniform
+    }
+    if (ok) hits.push({ at: i, delta: delta ?? '' });
+  }
+
+  if (!hits.length) return { at: -1 };
+  if (hits.length > 1) {
+    throw new ToolError(
+      `the SEARCH text matches ${hits.length} places; include more surrounding `
+      + 'lines so it identifies exactly one',
+    );
+  }
+  return hits[0];
+}
+
+// Applies every block in order against the evolving text.
+export function applyEdits(text, blocks) {
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  let lines = text.split(/\r?\n/);
+  let changed = 0;
+
+  blocks.forEach((b, n) => {
+    const { at, delta } = locate(lines, b.search);
+    if (at < 0) {
+      throw new ToolError(
+        `the SEARCH text of block ${n + 1} is not in the file; read it again and `
+        + 'quote the lines exactly as they appear',
+      );
+    }
+    const wl = b.search.split('\n');
+    const rl = b.replace === '' ? [] : b.replace.split('\n')
+      .map((l) => (l.trim() ? delta + l : l));
+    lines = [...lines.slice(0, at), ...rl, ...lines.slice(at + wl.length)];
+    changed++;
+  });
+
+  return { text: lines.join(eol), changed };
+}
+
 export const tools = {
   read: {
     summary: 'read a file',
@@ -158,6 +262,42 @@ export const tools = {
       } finally {
         closeSync(fd);
       }
+    },
+  },
+
+edit: {
+    body: true,
+    summary: 'change part of a file (preferred over write for an existing file)',
+    describe: (a, body) => {
+      let n;
+      try { n = parseEditBlocks(body).length; } catch { n = 0; }
+      return `edit ${a.path}${n ? ` (${n} block${n === 1 ? '' : 's'})` : ''}`;
+    },
+    usage: '<clichat:edit path="src/index.js">\n'
+      + '<<<<<<< SEARCH\nthe exact lines to find\n'
+      + '=======\nwhat to put there instead\n'
+      + '>>>>>>> REPLACE\n</clichat:edit>',
+    mutates: true,
+    run(ctx, a, body) {
+      const rootReal = realpathSync(ctx.root);
+      const full = safePath(rootReal, a.path);
+      if (!lexists(full)) throw new ToolError(`no such file: ${a.path}; use write to create it`);
+
+      const blocks = parseEditBlocks(body);
+
+      const rfd = openRegular(full, a.path);
+      let before;
+      try { before = readFileSync(rfd, 'utf8'); } finally { closeSync(rfd); }
+
+      const { text, changed } = applyEdits(before, blocks);
+      if (text === before) return `${a.path} already matched the replacement; nothing changed`;
+
+      const wfd = openRegular(full, a.path, { write: true });
+      try { writeSync(wfd, text); } finally { closeSync(wfd); }
+
+      const d = text.split('\n').length - before.split('\n').length;
+      return `edited ${a.path} (${changed} block${changed === 1 ? '' : 's'}, `
+        + `${d === 0 ? 'same line count' : `${d > 0 ? '+' : ''}${d} lines`})`;
     },
   },
 

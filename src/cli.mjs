@@ -29,8 +29,9 @@ OPTIONS
 
 CODE
   clichat code [--root <dir>] [-y] [--max-steps 24] "<task>"
-  A native agent loop. The model gets three tools -- read, write and list --
+  A native agent loop. The model gets four tools -- read, edit, write, list --
   in a tag grammar whose bodies are raw, so file contents need no escaping.
+  edit takes SEARCH/REPLACE blocks and refuses an ambiguous match.
   Every path is confined to --root (default: the current directory), and each
   write is confirmed unless -y is passed.
 

@@ -31,17 +31,24 @@ export function renderSystemPrompt(root) {
     '',
     'TOOLS',
   ];
+  // Usage is rendered flush left. Indenting it would invite the model to indent
+  // a tag body too, and a body is literal -- the indentation would land in the
+  // file, or shift a SEARCH block away from what it is meant to match.
   for (const t of Object.values(tools)) {
-    lines.push(`  ${t.summary}:`, ...t.usage.split('\n').map((l) => `    ${l}`), '');
+    lines.push(`# ${t.summary}`, t.usage, '');
   }
   lines.push(
     'RULES',
     '- A tool tag must start at the beginning of a line.',
     '- Do NOT wrap tool tags in markdown fences. Emit them raw.',
     '- Paths are relative to the workspace root. Never use absolute paths or "..".',
+    '- Use edit to change a file that already exists, and write only to create a',
+    '  new one or to replace a file wholesale.',
+    '- Read a file before you edit it, and quote the SEARCH lines exactly as they',
+    '  appear, including indentation. SEARCH must match one place in the file; if',
+    '  it could match more, include more surrounding lines.',
     '- write replaces the whole file. Emit the complete new contents, never a diff',
-    '  and never a fragment with "... rest unchanged". Read the file first if you',
-    '  are changing one you have not seen.',
+    '  and never a fragment with "... rest unchanged".',
     '- The body of a write tag is literal file content. Do not escape it.',
     '- You may emit several tags in one reply; they run in order.',
     '- After each reply that contains tags, you will be shown the results and can',

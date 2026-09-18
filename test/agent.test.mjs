@@ -278,3 +278,126 @@ test('a file is refused as a root', () => {
   writeFileSync(join(root, 'f.txt'), 'x');
   assert.throws(() => resolveRoot(join(root, 'f.txt')), ToolError);
 });
+
+// ------------------------------------------------------------------- editing
+
+import { parseEditBlocks, applyEdits } from '../src/fstools.mjs';
+
+const block = (search, replace) =>
+  `<<<<<<< SEARCH\n${search}\n=======\n${replace}\n>>>>>>> REPLACE`;
+
+test('parses one SEARCH/REPLACE block', () => {
+  assert.deepEqual(parseEditBlocks(block('old', 'new')), [{ search: 'old', replace: 'new' }]);
+});
+
+test('parses several blocks from one body', () => {
+  const blocks = parseEditBlocks(`${block('a', 'A')}\n${block('b', 'B')}`);
+  assert.deepEqual(blocks.map((b) => b.search), ['a', 'b']);
+});
+
+test('markers are tolerated when the model indents them', () => {
+  const body = block('old', 'new').split('\n').map((l) => `    ${l}`).join('\n');
+  assert.equal(parseEditBlocks(body)[0].search, '    old');
+});
+
+test('a body with no block at all is an error', () => {
+  assert.throws(() => parseEditBlocks('please change foo to bar'), /SEARCH/);
+});
+
+test('a block missing its divider is an error, not a silent half-edit', () => {
+  assert.throws(() => parseEditBlocks('<<<<<<< SEARCH\nold\n>>>>>>> REPLACE'), /divider/);
+});
+
+test('an empty SEARCH is refused -- that is what write is for', () => {
+  assert.throws(() => parseEditBlocks('<<<<<<< SEARCH\n=======\nnew\n>>>>>>> REPLACE'),
+    /empty SEARCH/);
+});
+
+test('applies an exact match', () => {
+  const { text, changed } = applyEdits('a\nb\nc\n', parseEditBlocks(block('b', 'B')));
+  assert.equal(text, 'a\nB\nc\n');
+  assert.equal(changed, 1);
+});
+
+test('applies several blocks in order', () => {
+  const { text } = applyEdits('a\nb\nc\n', parseEditBlocks(`${block('a', 'A')}\n${block('c', 'C')}`));
+  assert.equal(text, 'A\nb\nC\n');
+});
+
+test('a multi-line replacement can grow the file', () => {
+  const { text } = applyEdits('x\nb\ny\n', parseEditBlocks(block('b', 'b1\nb2\nb3')));
+  assert.equal(text, 'x\nb1\nb2\nb3\ny\n');
+});
+
+test('an empty REPLACE deletes the lines', () => {
+  const { text } = applyEdits('a\nb\nc\n', parseEditBlocks('<<<<<<< SEARCH\nb\n=======\n>>>>>>> REPLACE'));
+  assert.equal(text, 'a\nc\n');
+});
+
+test('AMBIGUITY IS AN ERROR -- editing the wrong one of two matches is the risk', () => {
+  assert.throws(
+    () => applyEdits('x\nfoo\ny\nfoo\nz\n', parseEditBlocks(block('foo', 'bar'))),
+    /matches 2 places/,
+  );
+});
+
+test('more context resolves the ambiguity', () => {
+  const { text } = applyEdits('x\nfoo\ny\nfoo\nz\n', parseEditBlocks(block('y\nfoo', 'y\nbar')));
+  assert.equal(text, 'x\nfoo\ny\nbar\nz\n');
+});
+
+test('text that is simply not there is an error naming the block', () => {
+  assert.throws(() => applyEdits('a\n', parseEditBlocks(block('nope', 'x'))), /block 1 is not in the file/);
+});
+
+test('trailing whitespace in the quoted lines is tolerated', () => {
+  const { text } = applyEdits('a\n  b\nc\n', parseEditBlocks(block('  b   ', '  B')));
+  assert.equal(text, 'a\n  B\nc\n');
+});
+
+test('a uniformly re-indented SEARCH still matches, and the fix keeps the file indent', () => {
+  // The model quotes the body of a function without its surrounding indentation.
+  const file = 'function f() {\n    const a = 1;\n    return a;\n}\n';
+  const { text } = applyEdits(file, parseEditBlocks(block('const a = 1;\nreturn a;', 'const a = 2;\nreturn a * 2;')));
+  assert.equal(text, 'function f() {\n    const a = 2;\n    return a * 2;\n}\n');
+});
+
+test('a NON-uniform indent shift does not match -- that would be a guess', () => {
+  const file = 'if (x) {\n    a();\n        b();\n}\n';
+  assert.throws(() => applyEdits(file, parseEditBlocks(block('a();\nb();', 'c();'))), /not in the file/);
+});
+
+test('CRLF files keep their line endings', () => {
+  const { text } = applyEdits('a\r\nb\r\nc\r\n', parseEditBlocks(block('b', 'B')));
+  assert.equal(text, 'a\r\nB\r\nc\r\n');
+});
+
+test('edit writes the file and reports what changed', () => {
+  const root = sandbox();
+  writeFileSync(join(root, 'a.js'), 'const x = 1;\nexport default x;\n');
+  const out = tools.edit.run({ root }, { path: 'a.js' }, block('const x = 1;', 'const x = 42;'));
+  assert.match(out, /^edited a\.js \(1 block/);
+  assert.equal(readFileSync(join(root, 'a.js'), 'utf8'), 'const x = 42;\nexport default x;\n');
+});
+
+test('edit on a missing file points at write', () => {
+  assert.throws(() => tools.edit.run({ root: sandbox() }, { path: 'nope.js' }, block('a', 'b')),
+    /use write to create it/);
+});
+
+test('edit obeys the same confinement as write', () => {
+  const root = sandbox();
+  const outside = sandbox();
+  const victim = join(outside, 'real.txt');
+  writeFileSync(victim, 'secret');
+  symlinkSync(victim, join(root, 'live'));
+  assert.throws(() => tools.edit.run({ root }, { path: 'live' }, block('secret', 'OWNED')), ToolError);
+  assert.throws(() => tools.edit.run({ root }, { path: '../x' }, block('a', 'b')), ToolError);
+  assert.equal(readFileSync(victim, 'utf8'), 'secret');
+});
+
+test('a no-op edit says so instead of claiming a change', () => {
+  const root = sandbox();
+  writeFileSync(join(root, 'a.js'), 'same\n');
+  assert.match(tools.edit.run({ root }, { path: 'a.js' }, block('same', 'same')), /nothing changed/);
+});
