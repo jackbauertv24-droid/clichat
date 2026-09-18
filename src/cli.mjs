@@ -5,7 +5,7 @@ import { loadConfig, saveConfig, configPath } from './config.mjs';
 import { solveHash, deepseekHash } from './pow.mjs';
 import { ChatTUI } from './tui.mjs';
 import { createServer } from './server.mjs';
-import { runAgent } from './agent.mjs';
+import { runAgent, createAgentSession } from './agent.mjs';
 import { resolveRoot, ToolError } from './fstools.mjs';
 
 const HELP = `clichat -- talk to chat.deepseek.com from the terminal
@@ -15,7 +15,8 @@ USAGE
   clichat tui                  start the full-screen chat UI
   clichat "your question"      ask once and print the answer
   echo "question" | clichat    read the prompt from stdin
-  clichat code "do a thing"    run the agent loop: it reads and writes files
+  clichat code                 start an interactive agent session
+  clichat code "do a thing"    run the agent on one task and exit
   clichat serve                run an OpenAI-compatible API on localhost
   clichat auth                 sign in and store a token
   clichat pow-selftest         verify the proof-of-work solver
@@ -28,12 +29,18 @@ OPTIONS
   -h, --help       show this help
 
 CODE
-  clichat code [--root <dir>] [-y] [--max-steps 24] "<task>"
+  clichat code [--root <dir>] [-y] [-i] [--max-steps 24] ["<task>"]
   A native agent loop. The model gets four tools -- read, edit, write, list --
   in a tag grammar whose bodies are raw, so file contents need no escaping.
   edit takes SEARCH/REPLACE blocks and refuses an ambiguous match.
   Every path is confined to --root (default: the current directory), and each
   write is confirmed unless -y is passed.
+
+  With no task it starts an interactive session; -i does the same after
+  running the task you gave it. A session keeps its context, so a follow-up
+  lands in a model that still remembers the files it just read.
+  In a session: /new /yes /think /steps /root /help /exit
+  End a line with \\ to continue it, or type """ alone to open a block.
 
 SERVE
   clichat serve [--port 8123] [--host 127.0.0.1] [--api-key <key>]
@@ -75,6 +82,7 @@ function parseArgs(argv) {
     else if (a === '--root') opts.root = argv[++i];
     else if (a === '-y' || a === '--yes') opts.yes = true;
     else if (a === '--max-steps') opts.maxSteps = Number(argv[++i]);
+    else if (a === '-i' || a === '--interactive') opts.interactive = true;
     else opts.words.push(a);
   }
   return opts;
@@ -213,6 +221,98 @@ function agentUI() {
   };
 }
 
+const CODE_HELP = `  /new      forget the conversation and start fresh
+  /yes      toggle confirming each write      /think   toggle the reasoning model
+  /steps N  set the step cap                  /root    show the workspace root
+  /help     this list                         /exit    leave
+
+  end a line with \\ to continue it, or type """ alone to open a block`;
+
+// Queues every line readline produces, rather than asking for one at a time.
+//
+// rl.question() only registers interest in the NEXT line, so anything arriving
+// while the agent is busy -- a follow-up typed ahead, or the rest of a piped
+// script -- is emitted with nobody listening and silently dropped. Queueing
+// keeps type-ahead, and lets a whole session be piped in.
+export function lineQueue(rl) {
+  const ready = [];
+  const waiting = [];
+  let closed = false;
+
+  rl.on('line', (line) => {
+    const w = waiting.shift();
+    if (w) w.resolve(line);
+    else ready.push(line);
+  });
+  rl.on('close', () => {
+    closed = true;
+    while (waiting.length) waiting.shift().reject(new Error('input closed'));
+  });
+
+  return {
+    next(prompt = '') {
+      if (prompt) stdout.write(prompt);
+      if (ready.length) return Promise.resolve(ready.shift());
+      if (closed) return Promise.reject(new Error('input closed'));
+      return new Promise((resolve, reject) => waiting.push({ resolve, reject }));
+    },
+  };
+}
+
+// Reads one task, which may run to several lines.
+//
+// A task worth giving an agent is often a paragraph, and argv is a poor place to
+// put one. Two ways in: a trailing backslash continues the line, and a lone
+// triple quote opens a block that another one closes -- the latter is what you
+// want when pasting, since it needs nothing added to each line.
+export async function readTask(input, prompt) {
+  let line = await input.next(prompt);
+
+  if (line.trim() === '"""') {
+    const body = [];
+    for (;;) {
+      const next = await input.next(dim('… '));
+      if (next.trim() === '"""') break;
+      body.push(next);
+    }
+    return body.join('\n').trim();
+  }
+
+  const parts = [];
+  while (line.endsWith('\\')) {
+    parts.push(line.slice(0, -1));
+    line = await input.next(dim('… '));
+  }
+  parts.push(line);
+  return parts.join('\n').trim();
+}
+
+// Runs one task and reports how it ended. Returns the exit code for one-shot use.
+async function runOneTask(client, opts, session, task, approve, ui) {
+  try {
+    const res = await runAgent({
+      client, task, session,
+      thinking: opts.think,
+      maxSteps: Number.isFinite(opts.maxSteps) && opts.maxSteps > 0 ? opts.maxSteps : 24,
+      approve,
+      ui,
+    });
+    if (!res.done) {
+      stderr.write(dim(`\nstopped after ${res.steps} steps without finishing; `
+        + 'say "continue" to carry on\n'));
+      return 1;
+    }
+    stdout.write(dim(`\ndone in ${res.steps} step${res.steps === 1 ? '' : 's'}\n`));
+    return 0;
+  } catch (err) {
+    if (err instanceof DeepSeekError || err instanceof ToolError) {
+      stderr.write(`\n${err.message}\n`);
+      return 1;
+    }
+    throw err;
+  }
+}
+
 async function cmdCode(client, opts, task) {
   // resolveRoot refuses a root where confinement would be meaningless -- the
   // filesystem root, a system directory, your home directory.
@@ -225,39 +325,83 @@ async function cmdCode(client, opts, task) {
     return 1;
   }
 
-  // Without a TTY there is nobody to answer the confirmation -- and readStdin has
-  // already drained stdin to build the task -- so ask for -y rather than hang.
+  // A one-shot task with no terminal has nobody to answer the confirmation --
+  // and readStdin has already drained stdin -- so ask for -y rather than hang.
+  const interactive = !task || opts.interactive;
   if (!opts.yes && !stdin.isTTY) {
     stderr.write('writes need confirming but stdin is not a terminal; pass -y to allow them\n');
+    return 1;
+  }
+  if (interactive && !stdin.isTTY) {
+    stderr.write('clichat code needs a task argument when stdin is not a terminal\n');
     return 1;
   }
 
   stdout.write(`${bold('clichat code')}  ${dim(root)}\n`);
   if (opts.yes) stdout.write(dim('  writes are not confirmed (-y)\n'));
+  if (interactive) stdout.write(dim('  /help for commands, /exit to leave\n'));
+
+  const session = createAgentSession(root);
+  const ui = agentUI();
+  const rl = (opts.yes && !interactive)
+    ? null
+    : createInterface({ input: stdin, output: stdout, historySize: 500 });
+  const input = rl ? lineQueue(rl) : null;
 
   // One prompt per write. The model was never trained to call tools, so this is
   // the backstop for a reply that looks plausible and names the wrong file.
-  const rl = opts.yes ? null : createInterface({ input: stdin, output: stdout });
   const approve = async (label) => {
-    if (!rl) return true;
-    const a = (await rl.question(`  ${bold('?')} ${label}  [Y/n] `)).trim().toLowerCase();
+    if (opts.yes || !input) return true;
+    const a = (await input.next(`  ${bold('?')} ${label}  [Y/n] `)).trim().toLowerCase();
     return a === '' || a === 'y' || a === 'yes';
   };
 
   try {
-    const res = await runAgent({
-      client, task, root,
-      thinking: opts.think,
-      maxSteps: Number.isFinite(opts.maxSteps) && opts.maxSteps > 0 ? opts.maxSteps : 24,
-      approve,
-      ui: agentUI(),
-    });
-    if (!res.done) {
-      stderr.write(dim(`\nstopped after ${res.steps} steps without finishing\n`));
-      return 1;
+    let code = 0;
+    if (task) code = await runOneTask(client, opts, session, task, approve, ui);
+    if (!interactive) return code;
+
+    for (;;) {
+      let text;
+      try {
+        text = await readTask(input, bold('\n> '));
+      } catch {
+        break; // ctrl-c / ctrl-d
+      }
+      if (!text) continue;
+
+      if (text === '/exit' || text === '/quit') break;
+      if (text === '/help') { stdout.write(`${CODE_HELP}\n`); continue; }
+      if (text === '/root') { stdout.write(dim(`${root}\n`)); continue; }
+      if (text === '/new') {
+        // A fresh session: the model forgets the files it has already read.
+        Object.assign(session, createAgentSession(root));
+        stdout.write(dim('started a new conversation\n'));
+        continue;
+      }
+      if (text === '/yes') {
+        opts.yes = !opts.yes;
+        stdout.write(dim(`writes are ${opts.yes ? 'no longer confirmed' : 'confirmed again'}\n`));
+        continue;
+      }
+      if (text === '/think') {
+        opts.think = !opts.think;
+        stdout.write(dim(`thinking ${opts.think ? 'on' : 'off'}\n`));
+        continue;
+      }
+      if (text.startsWith('/steps')) {
+        const n = Number(text.split(/\s+/)[1]);
+        if (Number.isFinite(n) && n > 0) {
+          opts.maxSteps = n;
+          stdout.write(dim(`step cap is ${n}\n`));
+        } else stdout.write(dim(`step cap is ${opts.maxSteps || 24}\n`));
+        continue;
+      }
+      if (text.startsWith('/')) { stdout.write(dim(`unknown command; ${'/help'} lists them\n`)); continue; }
+
+      code = await runOneTask(client, opts, session, text, approve, ui);
     }
-    stdout.write(dim(`\ndone in ${res.steps} step${res.steps === 1 ? '' : 's'}\n`));
-    return 0;
+    return code;
   } finally {
     rl?.close();
   }
@@ -286,7 +430,6 @@ export async function main(argv) {
   if (sub === 'code') {
     const task = [await readStdin(), opts.words.slice(1).join(' ').trim()]
       .filter(Boolean).join('\n').trim();
-    if (!task) { stderr.write('usage: clichat code "<task>"\n'); return 1; }
     return cmdCode(client, opts, task);
   }
 

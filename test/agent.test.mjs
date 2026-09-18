@@ -401,3 +401,174 @@ test('a no-op edit says so instead of claiming a change', () => {
   writeFileSync(join(root, 'a.js'), 'same\n');
   assert.match(tools.edit.run({ root }, { path: 'a.js' }, block('same', 'same')), /nothing changed/);
 });
+
+// -------------------------------------------------------------- the loop
+//
+// Driven against a stub backend, so the loop's own behaviour is pinned without
+// spending a real session on it.
+
+import { runAgent, createAgentSession } from '../src/agent.mjs';
+import { readTask, lineQueue } from '../src/cli.mjs';
+import { EventEmitter } from 'node:events';
+
+function stubClient(replies) {
+  const prompts = [];
+  return {
+    prompts,
+    sessions: 0,
+    async createSession() { this.sessions++; return `sess-${this.sessions}`; },
+    async *stream({ prompt }) {
+      prompts.push(prompt);
+      const text = replies.shift() ?? 'Nothing left to do.';
+      yield { type: 'message_id', id: `m${prompts.length}` };
+      for (const chunk of text.match(/[\s\S]{1,7}/g) ?? []) yield { type: 'content', text: chunk };
+    },
+  };
+}
+
+const nullUI = () => ({
+  step() {}, thinkingStart() {}, thinking() {}, prose() {},
+  endTurn() {}, toolOk() {}, toolError() {}, skipped() {},
+});
+
+const writeTag = (path, body) => `<clichat:write path="${path}">\n${body}\n</clichat:write>`;
+
+test('runs a tool, feeds the result back, and stops on prose', async () => {
+  const root = sandbox();
+  const client = stubClient([writeTag('a.txt', 'hello'), 'All done.']);
+  const session = createAgentSession(root);
+
+  const res = await runAgent({ client, task: 'make a.txt', session, ui: nullUI() });
+
+  assert.equal(res.done, true);
+  assert.equal(res.steps, 2);
+  assert.equal(readFileSync(join(root, 'a.txt'), 'utf8'), 'hello');
+  assert.match(client.prompts[1], /<clichat:result tool="write" status="ok">/);
+});
+
+test('the tool instructions are sent once, not with every task', async () => {
+  const root = sandbox();
+  const client = stubClient(['ok.', 'ok.']);
+  const session = createAgentSession(root);
+
+  await runAgent({ client, task: 'first task', session, ui: nullUI() });
+  await runAgent({ client, task: 'second task', session, ui: nullUI() });
+
+  assert.match(client.prompts[0], /TOOLS/);
+  assert.match(client.prompts[0], /TASK: first task/);
+  assert.equal(client.prompts[1], 'second task', 'the preamble was resent');
+  assert.equal(client.sessions, 1, 'a second session was created');
+});
+
+test('a follow-up keeps the same session and parent message', async () => {
+  const root = sandbox();
+  const client = stubClient(['ok.', 'ok.']);
+  const session = createAgentSession(root);
+
+  await runAgent({ client, task: 'one', session, ui: nullUI() });
+  const after = session.parentMessageId;
+  await runAgent({ client, task: 'two', session, ui: nullUI() });
+
+  assert.equal(session.sessionId, 'sess-1');
+  assert.notEqual(session.parentMessageId, after, 'the chain did not advance');
+});
+
+test('the step cap stops a model that will not stop', async () => {
+  const root = sandbox();
+  const client = stubClient(Array(50).fill(writeTag('a.txt', 'again')));
+  const res = await runAgent({
+    client, task: 'loop forever', session: createAgentSession(root),
+    maxSteps: 4, ui: nullUI(),
+  });
+  assert.equal(res.done, false);
+  assert.equal(res.steps, 4);
+});
+
+test('a declined write is not applied, and the model is told', async () => {
+  const root = sandbox();
+  const client = stubClient([writeTag('nope.txt', 'x'), 'understood.']);
+  await runAgent({
+    client, task: 'write it', session: createAgentSession(root),
+    approve: async () => false, ui: nullUI(),
+  });
+  assert.equal(existsSync(join(root, 'nope.txt')), false);
+  assert.match(client.prompts[1], /declined/);
+});
+
+test('a tool error is fed back so the model can recover', async () => {
+  const root = sandbox();
+  const client = stubClient(['<clichat:read path="missing.txt"/>', 'I see.']);
+  await runAgent({ client, task: 'read it', session: createAgentSession(root), ui: nullUI() });
+  assert.match(client.prompts[1], /status="error"/);
+  assert.match(client.prompts[1], /no such file/);
+});
+
+test('an unterminated tag is reported rather than half-applied', async () => {
+  const root = sandbox();
+  const client = stubClient(['<clichat:write path="a.txt">\nhalf a fi', 'sorry.']);
+  await runAgent({ client, task: 'go', session: createAgentSession(root), ui: nullUI() });
+  assert.equal(existsSync(join(root, 'a.txt')), false);
+  assert.match(client.prompts[1], /never closed/);
+});
+
+// ------------------------------------------------------------ task input
+
+const stubInput = (lines) => ({ next: async () => lines.shift() });
+
+test('a plain line is the task', async () => {
+  assert.equal(await readTask(stubInput(['fix the bug']), '> '), 'fix the bug');
+});
+
+test('a trailing backslash continues onto the next line', async () => {
+  assert.equal(await readTask(stubInput(['first \\', 'second \\', 'third']), '> '),
+    'first \nsecond \nthird');
+});
+
+test('a triple quote opens a block that another one closes', async () => {
+  const lines = ['"""', 'line one', '', '  indented', '"""', 'ignored'];
+  assert.equal(await readTask(stubInput(lines), '> '), 'line one\n\n  indented');
+});
+
+test('a pasted block keeps characters that would need escaping elsewhere', async () => {
+  const lines = ['"""', 'use /[^\\w]/g and "quotes"', 'and a \\ backslash', '"""'];
+  assert.equal(await readTask(stubInput(lines), '> '), 'use /[^\\w]/g and "quotes"\nand a \\ backslash');
+});
+
+test('the line queue keeps input typed while the agent was busy', async () => {
+  // The bug this exists for: rl.question() registers for the NEXT line only, so
+  // a follow-up typed during a long step was emitted with nobody listening and
+  // silently dropped -- and the session then ended at EOF.
+  const rl = new EventEmitter();
+  const q = lineQueue(rl);
+
+  rl.emit('line', 'typed while busy');      // nobody is waiting yet
+  rl.emit('line', 'and another');
+
+  assert.equal(await q.next(), 'typed while busy');
+  assert.equal(await q.next(), 'and another');
+});
+
+test('the line queue still resolves a line that arrives later', async () => {
+  const rl = new EventEmitter();
+  const q = lineQueue(rl);
+  const pending = q.next();
+  rl.emit('line', 'arrived after the ask');
+  assert.equal(await pending, 'arrived after the ask');
+});
+
+test('the line queue rejects once input closes, which ends the session', async () => {
+  const rl = new EventEmitter();
+  const q = lineQueue(rl);
+  rl.emit('close');
+  await assert.rejects(() => q.next(), /input closed/);
+});
+
+test('a whole session can be piped in, queued ahead of time', async () => {
+  const rl = new EventEmitter();
+  const q = lineQueue(rl);
+  for (const l of ['first task', '"""', 'a block', 'of text', '"""', '/exit']) rl.emit('line', l);
+
+  assert.equal(await readTask(q, ''), 'first task');
+  assert.equal(await readTask(q, ''), 'a block\nof text');
+  assert.equal(await readTask(q, ''), '/exit');
+});

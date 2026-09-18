@@ -60,9 +60,54 @@ terminal on exit and on crash.
 calling one.
 
 ```sh
-clichat code "add a --json flag to bin/cli.js and document it in the README"
+clichat code                                    # interactive session
+clichat code "add a --json flag to bin/cli.js"  # one task, then exit
+clichat code -i "start with the failing test"   # one task, then stay
 clichat code --root ../other-project -y "fix the failing test"
 ```
+
+### Sessions
+
+With no task, `clichat code` starts a session and keeps the conversation, so a
+follow-up lands in a model that still remembers what it just read:
+
+```
+> create greet.js with an exported hello(name)
+  * write greet.js (3 lines)  created greet.js (3 lines, 59 bytes)
+
+> now add a goodbye(name) to that same file
+  * read greet.js  export function hello(name) {
+  * edit greet.js (1 block)  edited greet.js (1 block, +4 lines)
+```
+
+The tool instructions are sent once per session rather than with every task —
+the backend is stateful, so repeating them would pay twice for context it
+already has.
+
+| command | |
+| --- | --- |
+| `/new` | forget the conversation and start fresh |
+| `/yes` | toggle confirming each write |
+| `/think` | toggle the reasoning model |
+| `/steps N` | set the step cap |
+| `/root` | show the workspace root |
+| `/exit` | leave |
+
+A task worth giving an agent is often a paragraph, and argv is a poor place to
+put one. End a line with `\` to continue it, or type `"""` alone to open a
+block that another `"""` closes — the latter is what you want when pasting,
+since it needs nothing added to each line.
+
+```
+> """
+… Create config.js exporting a default object with:
+…   - port: 8080
+…   - host: "0.0.0.0"
+… """
+```
+
+Input typed while the agent is working is kept, not dropped, so you can queue a
+follow-up mid-step. A whole session can be piped in for the same reason.
 
 ```
 -------------------- step 1/24
@@ -332,7 +377,7 @@ src/cli.mjs            arg parsing, REPL, one-shot
 src/tui.mjs            full-screen chat UI
 src/server.mjs         OpenAI-compatible HTTP front end
 src/tools.mjs          prompt-based tool-call emulation (for serve)
-src/agent.mjs          native agent loop: tag protocol, tool dispatch
+src/agent.mjs          native agent loop: tag protocol, tool dispatch, sessions
 src/fstools.mjs        read/edit/write/list, confined to a root directory
 src/config.mjs         0600 credential storage
 scripts/fetch-wasm.mjs downloads + verifies DeepSeek's hasher (not vendored)

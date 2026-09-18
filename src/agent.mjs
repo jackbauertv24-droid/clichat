@@ -148,13 +148,26 @@ export class TagSuppressor {
 
 // ---------------------------------------------------------------- the loop
 
+// One conversation. Held across tasks so a follow-up ("now do the same for the
+// other handler") lands in a model that still remembers the files it just read.
+export function createAgentSession(root) {
+  return { root, sessionId: null, parentMessageId: null, primed: false };
+}
+
 export async function runAgent({
-  client, task, root, maxSteps = 24,
+  client, task, session, maxSteps = 24,
   thinking = false, approve = async () => true, ui,
 }) {
-  const ctx = { root };
-  const state = { sessionId: await client.createSession(), parentMessageId: null };
-  let prompt = `${renderSystemPrompt(root)}\n\nTASK: ${task}`;
+  const ctx = { root: session.root };
+  if (!session.sessionId) session.sessionId = await client.createSession();
+
+  // The tool instructions are sent once. The backend is stateful, so repeating
+  // them every task would pay for context the session already has.
+  const prompt0 = session.primed
+    ? task
+    : `${renderSystemPrompt(session.root)}\n\nTASK: ${task}`;
+  session.primed = true;
+  let prompt = prompt0;
 
   for (let step = 1; step <= maxSteps; step++) {
     ui.step(step, maxSteps);
@@ -164,12 +177,12 @@ export async function runAgent({
     let thinkingSeen = false;
 
     for await (const ev of client.stream({
-      sessionId: state.sessionId,
-      parentMessageId: state.parentMessageId,
+      sessionId: session.sessionId,
+      parentMessageId: session.parentMessageId,
       prompt,
       thinking,
     })) {
-      if (ev.type === 'message_id') { state.parentMessageId = ev.id; continue; }
+      if (ev.type === 'message_id') { session.parentMessageId = ev.id; continue; }
       if (ev.type === 'thinking') {
         if (!thinkingSeen) { ui.thinkingStart(); thinkingSeen = true; }
         ui.thinking(ev.text);
