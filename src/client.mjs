@@ -164,10 +164,30 @@ async function* streamOfString(s) { yield Buffer.from(s); }
 
 // The web API has shipped two delta shapes: an OpenAI-ish choices/delta form and
 // a path-addressed patch form ({v,p,o}). Handle both, ignore anything else.
+//
+// The patch form now carries text in `response/fragments`, each typed RESPONSE
+// or THINK. A fragment is born with its first chunk of text already inside it
+// -- in the opening `{v:{response:{fragments:[...]}}}` or in a later APPEND to
+// `response/fragments` -- and only the chunks after that arrive as strings on
+// `response/fragments/-1/content`. Missing the birth drops the first token, which
+// is how "You're right" used to come out as "'re right". Both paths end in
+// `/content`, so the fragment's type, not the path, says which stream it is.
 export async function* parseSSE(body, debug = false) {
   const decoder = new TextDecoder();
   let buf = '';
   let lastPath = 'response/content';
+  const fragTypes = [];
+
+  const kindOf = (type) => (/THINK/i.test(String(type ?? '')) ? 'thinking' : 'content');
+  function* fragments(list) {
+    if (!Array.isArray(list)) return;
+    for (const f of list) {
+      fragTypes.push(f?.type);
+      if (typeof f?.content === 'string' && f.content) {
+        yield { type: kindOf(f.type), text: f.content };
+      }
+    }
+  }
 
   for await (const chunk of body) {
     buf += decoder.decode(chunk, { stream: true });
@@ -196,11 +216,18 @@ export async function* parseSSE(body, debug = false) {
       if ('v' in ev) {
         if (typeof ev.p === 'string' && ev.p) lastPath = ev.p;
         const path = typeof ev.p === 'string' && ev.p ? ev.p : lastPath;
+        const frag = /^response\/fragments\/(-?\d+)\/content$/.exec(path);
         if (typeof ev.v === 'string') {
-          if (path.endsWith('thinking_content')) yield { type: 'thinking', text: ev.v };
+          if (frag) {
+            const i = Number(frag[1]);
+            yield { type: kindOf(fragTypes.at(i)), text: ev.v };
+          } else if (path.endsWith('thinking_content')) yield { type: 'thinking', text: ev.v };
           else if (path.endsWith('content')) yield { type: 'content', text: ev.v };
+        } else if (path === 'response/fragments' && Array.isArray(ev.v)) {
+          yield* fragments(ev.v);
         } else if (ev.v && typeof ev.v === 'object') {
           const r = ev.v.response ?? ev.v;
+          yield* fragments(r?.fragments);
           if (typeof r?.thinking_content === 'string' && r.thinking_content) {
             yield { type: 'thinking', text: r.thinking_content };
           }
